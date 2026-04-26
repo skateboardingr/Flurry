@@ -28,6 +28,7 @@ from .analyzer import (
     detect_combat,
     group_into_encounters,
     merge_encounter,
+    apply_pet_owners,
     bucket_hits,
     AttackerStats,
     HealerStats,
@@ -39,6 +40,14 @@ from .analyzer import (
     DEFAULT_SPECIAL_MODS,
     is_crit,
     extract_specials,
+)
+from .sidecar import (
+    Sidecar,
+    ManualEncounter,
+    fight_key,
+    load_sidecar,
+    save_sidecar,
+    sidecar_path,
 )
 from .events import (
     Event,
@@ -57,7 +66,7 @@ __all__ = [
     '__version__',
     # analyzer
     'analyze_fight', 'detect_fights', 'detect_combat',
-    'group_into_encounters', 'merge_encounter',
+    'group_into_encounters', 'merge_encounter', 'apply_pet_owners',
     'bucket_hits',
     'AttackerStats', 'HealerStats', 'FightResult', 'Encounter',
     'Hit', 'Heal', 'Timeline',
@@ -67,4 +76,7 @@ __all__ = [
     'DeathMessage', 'ZoneEntered', 'UnknownEvent',
     # parser & tail
     'parse_line', 'tail_file',
+    # sidecar
+    'Sidecar', 'ManualEncounter', 'fight_key',
+    'load_sidecar', 'save_sidecar', 'sidecar_path',
 ]

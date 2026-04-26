@@ -12,15 +12,16 @@ returned dataclasses. That separation lets the same analysis power
 text reports, charts, dashboards, and downstream automation.
 """
 
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .events import (
     MeleeHit, MeleeMiss, SpellDamage, DeathMessage, HealEvent, UnknownEvent,
 )
 from .parser import parse_line
-from .tail import tail_file
+from .tail import tail_file, find_offset_for_timestamp
 
 
 # Special-attack modifier names that the analyzer breaks out separately.
@@ -67,6 +68,11 @@ class Hit:
     # `hits`, etc.). Lets the UI break melee damage down by attack type so
     # a rogue's backstabs are distinguishable from auto-attack.
     verb: Optional[str] = None
+    # When `apply_pet_owners` rewrites a pet's attacker name to its
+    # owner, this carries the original raw actor name so the UI can
+    # surface the pet as a damage source within the owner's row. None
+    # for hits that weren't rewritten.
+    pet_origin: Optional[str] = None
 
 
 @dataclass
@@ -94,6 +100,9 @@ class Heal:
     amount: int
     spell: Optional[str] = None
     modifiers: List[str] = field(default_factory=list)
+    # Same role as Hit.pet_origin — set when a pet's heal is rewritten to
+    # its owner's name so the UI can credit the pet as the source.
+    pet_origin: Optional[str] = None
 
 
 @dataclass
@@ -299,6 +308,8 @@ def detect_fights(logfile: str,
                   gap_seconds: int = 15,
                   min_damage: int = 10_000,
                   min_duration_seconds: int = 0,
+                  since: Optional[datetime] = None,
+                  progress_cb: Optional[Callable[[int, int], None]] = None,
                   special_mods=DEFAULT_SPECIAL_MODS) -> List[FightResult]:
     """Backward-compat wrapper around `detect_combat` that returns just
     the fights, discarding heals. New code should call `detect_combat`."""
@@ -306,6 +317,8 @@ def detect_fights(logfile: str,
                               gap_seconds=gap_seconds,
                               min_damage=min_damage,
                               min_duration_seconds=min_duration_seconds,
+                              since=since,
+                              progress_cb=progress_cb,
                               special_mods=special_mods)
     return fights
 
@@ -315,6 +328,8 @@ def detect_combat(logfile: str,
                   min_damage: int = 10_000,
                   min_duration_seconds: int = 0,
                   heals_extend_fights: bool = False,
+                  since: Optional[datetime] = None,
+                  progress_cb: Optional[Callable[[int, int], None]] = None,
                   special_mods=DEFAULT_SPECIAL_MODS
                   ) -> Tuple[List[FightResult], List[Heal]]:
     """Walk the log once and return both detected fights and a flat heal
@@ -343,6 +358,16 @@ def detect_combat(logfile: str,
                   Defaults to 0 (no filter). Useful for hiding one-shot
                   rampage swings on a single trash mob that you didn't
                   actually engage.
+      since: optional cutoff datetime — events with `timestamp < since`
+                  are skipped. Combined with `find_offset_for_timestamp`
+                  this lets the caller analyze only the tail of a long
+                  log without paying the cost of parsing the prefix.
+      progress_cb: optional callable `(bytes_read, total_bytes)` invoked
+                  periodically (every ~256KB of file read) so the caller
+                  can update a UI progress bar. Errors swallowed inside
+                  `tail_file`. `total_bytes` reflects the raw file size
+                  not the slice size — matters for UI math when `since`
+                  is set and we start mid-file.
       special_mods: tuple of special-attack modifier names to break out.
 
     Returns:
@@ -353,6 +378,30 @@ def detect_combat(logfile: str,
     in_progress: Dict[str, _FightBuilder] = {}
     completed: List[FightResult] = []
     heals: List[Heal] = []
+
+    # Resolve `since` to a starting byte offset. Skipping the prefix of a
+    # huge log is the bulk of the speedup; the inline `since` filter
+    # below is a backstop for any old lines that sneak through (e.g. an
+    # off-by-one near the cutoff).
+    start_offset = 0
+    if since is not None:
+        try:
+            start_offset = find_offset_for_timestamp(logfile, since)
+        except OSError:
+            start_offset = 0
+
+    file_size = os.path.getsize(logfile) if os.path.isfile(logfile) else 0
+    # Report progress relative to the slice we actually walk so a slice
+    # starting two-thirds into the file shows 0% → 100% across the work
+    # we're doing, not the work we skipped.
+    slice_size = max(0, file_size - start_offset)
+    inner_progress = None
+    if progress_cb is not None:
+        def inner_progress(abs_pos: int):
+            try:
+                progress_cb(max(0, abs_pos - start_offset), slice_size)
+            except Exception:
+                pass
 
     def _close(target: str, end_ts: datetime, complete: bool):
         b = in_progress.pop(target)
@@ -372,9 +421,13 @@ def detect_combat(logfile: str,
             in_progress[target] = _FightBuilder(target, ev.timestamp, special_mods)
         in_progress[target].record_hit(ev, kind)
 
-    for line in tail_file(logfile, read_all=True, follow=False):
+    for line in tail_file(logfile, read_all=True, follow=False,
+                          start_offset=start_offset,
+                          progress_cb=inner_progress):
         ev = parse_line(line)
         if ev is None:
+            continue
+        if since is not None and ev.timestamp < since:
             continue
 
         if isinstance(ev, MeleeHit):
@@ -572,9 +625,22 @@ def _encounter_display_name(members: List[FightResult]) -> str:
     return max(pool, key=lambda m: m.total_damage).target
 
 
+def _fight_key(f: FightResult) -> Optional[str]:
+    """Stable composite key for a fight: lowercased target + ISO start.
+    Mirrors `flurry.sidecar.fight_key` so manual-encounter overrides round-
+    trip cleanly. Two fights with the same target+start are treated as the
+    same fight; only happens if the log itself is duplicated, which we
+    accept."""
+    if f.start is None:
+        return None
+    return f'{f.target.lower()}|{f.start.isoformat()}'
+
+
 def group_into_encounters(fights: List[FightResult],
                           gap_seconds: int = 0,
-                          heals: Optional[List[Heal]] = None) -> List['Encounter']:
+                          heals: Optional[List[Heal]] = None,
+                          manual_groups: Optional[List[dict]] = None
+                          ) -> List['Encounter']:
     """Bundle overlapping fights into encounters.
 
     Two fights are part of the same encounter if their windows overlap (or
@@ -584,9 +650,16 @@ def group_into_encounters(fights: List[FightResult],
     even a second of dead air as its own encounter. Bump `gap_seconds` if
     you want phase-transition pauses to merge back together too.
 
-    Returned encounters are 1-indexed by start time. Encounter ids are as
-    stable as the underlying fight ids (ie. stable for any prefix of the
-    same log).
+    `manual_groups` is the user override channel (sidecar persistence).
+    Each entry is `{'fight_keys': [<target|iso_ts>, ...], 'name': <opt>}`;
+    fights matching a manual group bypass auto-grouping and form their own
+    encounter regardless of timing. `name` overrides the auto-derived
+    display name. Empty / single-key / unknown-key groups are ignored —
+    nothing the user does to a stale sidecar can shadow real fights.
+
+    Returned encounters are 1-indexed by start time. Encounter ids are
+    stable for the same log + same params + same sidecar; they shift when
+    any of those change.
     """
     if not fights:
         return []
@@ -598,26 +671,65 @@ def group_into_encounters(fights: List[FightResult],
     if not sorted_fights:
         return []
 
-    groups: List[List[FightResult]] = [[sorted_fights[0]]]
-    cur_end = sorted_fights[0].end or sorted_fights[0].start
+    # Resolve manual groups to actual FightResult sets. We iterate by
+    # fight (not by sidecar key) so a sidecar referencing a fight that
+    # disappeared under new params is silently ignored — the missing keys
+    # just don't match anything. `manual_idx` maps a fight's id() to the
+    # index of the manual group it belongs to, if any.
+    manual_groups = manual_groups or []
+    manual_idx: Dict[int, int] = {}
+    manual_names: Dict[int, Optional[str]] = {}
+    for gi, group in enumerate(manual_groups):
+        keys = set(group.get('fight_keys') or [])
+        if len(keys) < 2:
+            continue
+        manual_names[gi] = group.get('name') or None
+        for f in sorted_fights:
+            k = _fight_key(f)
+            if k in keys and id(f) not in manual_idx:
+                manual_idx[id(f)] = gi
 
-    for f in sorted_fights[1:]:
-        gap = (f.start - cur_end).total_seconds()
-        if gap <= gap_seconds:
-            groups[-1].append(f)
-            f_end = f.end or f.start
-            if f_end and (cur_end is None or f_end > cur_end):
-                cur_end = f_end
-        else:
-            groups.append([f])
-            cur_end = f.end or f.start
+    # Auto-group only the fights that aren't manually claimed.
+    auto_fights = [f for f in sorted_fights if id(f) not in manual_idx]
+    auto_buckets: List[List[FightResult]] = []
+    if auto_fights:
+        auto_buckets.append([auto_fights[0]])
+        cur_end = auto_fights[0].end or auto_fights[0].start
+        for f in auto_fights[1:]:
+            gap = (f.start - cur_end).total_seconds()
+            if gap <= gap_seconds:
+                auto_buckets[-1].append(f)
+                f_end = f.end or f.start
+                if f_end and (cur_end is None or f_end > cur_end):
+                    cur_end = f_end
+            else:
+                auto_buckets.append([f])
+                cur_end = f.end or f.start
+
+    # Bucket manually-claimed fights back together. We use a dict so a
+    # group with fights from non-adjacent positions in `sorted_fights`
+    # still ends up as one bucket.
+    manual_buckets: Dict[int, List[FightResult]] = {}
+    for f in sorted_fights:
+        gi = manual_idx.get(id(f))
+        if gi is not None:
+            manual_buckets.setdefault(gi, []).append(f)
+
+    # Combine auto and manual groups, then sort by group start time so
+    # encounter ids reflect chronological order regardless of source.
+    all_groups: List[Tuple[List[FightResult], Optional[str]]] = []
+    for members in auto_buckets:
+        all_groups.append((members, None))
+    for gi, members in manual_buckets.items():
+        all_groups.append((members, manual_names.get(gi)))
+    all_groups.sort(key=lambda gn: min(f.start for f in gn[0]))
 
     encounters: List[Encounter] = []
-    for i, members in enumerate(groups, start=1):
+    for i, (members, name_override) in enumerate(all_groups, start=1):
         encounters.append(Encounter(
             encounter_id=i,
             members=members,
-            name=_encounter_display_name(members),
+            name=name_override or _encounter_display_name(members),
             fight_complete=any(m.fight_complete for m in members),
         ))
 
@@ -676,6 +788,117 @@ def merge_encounter(encounter: 'Encounter') -> FightResult:
         fight_complete=encounter.fight_complete,
         fight_id=encounter.encounter_id,
     )
+
+
+# ----- Pet ownership rewrite -----
+#
+# `apply_pet_owners` is a post-process pass that rewrites attacker/healer
+# names on hits and heals so unnamed pets ("Onyx Crusher") or other
+# entities the user has assigned an owner show up under `<owner>'s pet`
+# in the per-attacker tables. We do this after detect_combat instead of
+# inside the parser so:
+#   - the parser stays a pure regex layer with no user-state coupling, and
+#   - removing/changing a pet assignment is a re-render rather than a
+#     re-parse — cheap to iterate on in the UI.
+#
+# Backtick-pet names from the log itself (`Soloson\`s pet`) are already
+# handled by the parser's NAME pattern; this layer is for cases where EQ
+# writes the pet under its own proper name with no owner cue (mage water
+# pets, charmed mobs, etc.).
+
+def apply_pet_owners(fights: List[FightResult],
+                     heals: List[Heal],
+                     pet_owners: Dict[str, str]
+                     ) -> Tuple[List[FightResult], List[Heal]]:
+    """Return rewritten fights/heals where attackers in `pet_owners` are
+    merged into their owner's row. Original inputs are not mutated.
+
+    The rewrite changes `attacker` (or `healer`) to the owner's name and
+    sets `pet_origin` on each affected event to the original raw actor
+    name. The owner's own hits are unchanged. Per-attacker stats are
+    re-aggregated under the owner so two raw actors mapped to the same
+    owner sum cleanly, and the pet's damage ends up summed with the
+    owner's own.
+
+    The UI uses `pet_origin` to surface the pet as a "Source" row inside
+    the owner's pair-modal breakdown, so the user can still see what
+    fraction of the owner's row came from each pet without losing the
+    rolled-up DPS view.
+
+    Lookups are case-insensitive on the actor name; the relabel preserves
+    the owner casing the user typed. If `pet_owners` is empty the inputs
+    are returned unchanged (cheap no-op for the common case)."""
+    if not pet_owners:
+        return fights, heals
+
+    lookup = {k.lower(): v for k, v in pet_owners.items() if k and v}
+    if not lookup:
+        return fights, heals
+
+    def _rewrite_fight(f: FightResult) -> FightResult:
+        # Skip the rewrite entirely if no attacker in this fight is
+        # affected — keeps the per-fight pass cheap when the sidecar
+        # only renames a few names across a long log.
+        relevant = any(atk.lower() in lookup for atk in f.stats_by_attacker)
+        if not relevant:
+            return f
+        new_hits = []
+        for h in f.hits:
+            owner = lookup.get(h.attacker.lower())
+            if owner is not None:
+                new_hits.append(replace(h, attacker=owner,
+                                        pet_origin=h.attacker))
+            else:
+                new_hits.append(h)
+        # Re-aggregate per-attacker stats from the rewritten hits so a
+        # pet's damage rolls up under its owner. The owner's own hits
+        # also pass through this loop and accumulate into the same
+        # AttackerStats by name match, so owner + pet end up summed.
+        new_stats: Dict[str, AttackerStats] = {}
+        for h in new_hits:
+            s = new_stats.get(h.attacker)
+            if s is None:
+                s = AttackerStats(attacker=h.attacker)
+                new_stats[h.attacker] = s
+            s.damage += h.damage
+            s.hits += 1
+            if h.damage > s.biggest:
+                s.biggest = h.damage
+            if is_crit(h.modifiers):
+                s.crits += 1
+            for special in h.specials:
+                s.special_damage[special] = s.special_damage.get(special, 0) + h.damage
+                s.special_hits[special] = s.special_hits.get(special, 0) + 1
+        # Layer in miss counts from the original stats. Misses don't
+        # produce Hit objects so they wouldn't otherwise be rebuilt; the
+        # original AttackerStats is the source of truth for them.
+        for old_name, old in f.stats_by_attacker.items():
+            if old.misses == 0:
+                continue
+            new_name = lookup.get(old_name.lower(), old_name)
+            s = new_stats.get(new_name)
+            if s is None:
+                s = AttackerStats(attacker=new_name)
+                new_stats[new_name] = s
+            s.misses += old.misses
+        return FightResult(
+            target=f.target,
+            start=f.start,
+            end=f.end,
+            hits=new_hits,
+            stats_by_attacker=new_stats,
+            fight_complete=f.fight_complete,
+            fight_id=f.fight_id,
+        )
+
+    def _rewrite_heal(h: Heal) -> Heal:
+        owner = lookup.get(h.healer.lower())
+        if owner is not None:
+            return replace(h, healer=owner, pet_origin=h.healer)
+        return h
+
+    return ([_rewrite_fight(f) for f in fights],
+            [_rewrite_heal(h) for h in heals])
 
 
 # ----- Timeline bucketing -----

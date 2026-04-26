@@ -27,12 +27,18 @@ import webbrowser
 from datetime import datetime
 from typing import List, Optional
 
+from datetime import timedelta
+
 from .analyzer import (
     FightResult, Encounter, Heal,
-    detect_combat, group_into_encounters,
+    detect_combat, group_into_encounters, apply_pet_owners,
     merge_encounter, bucket_hits, collect_parser_stats,
     DEFAULT_SPECIAL_MODS,
 )
+from .sidecar import (
+    Sidecar, fight_key, load_sidecar, save_sidecar,
+)
+from .tail import read_last_timestamp
 
 
 # ----- JSON shape builders -----
@@ -55,13 +61,19 @@ def _hit_source(h) -> str:
     """Pick a single 'source' label for a Hit so the UI can group by it.
 
     Order of precedence:
-      1. `spell` — set on SpellDamage events (named spell, DS source, DoT
-         spell name).
-      2. First special — Headshot, Assassinate, Slay Undead, etc. — when
-         a special proc'd.
-      3. The melee verb, title-cased ('backstabs' -> 'Backstabs').
-      4. 'Melee' as a generic fallback.
+      1. `pet_origin` — set when `apply_pet_owners` rewrote a pet's
+         attacker name to its owner. Surfacing the original raw name
+         lets the user see "Onyx Crusher" as a source under Soloson's
+         row instead of losing the pet attribution to the merge.
+      2. `spell` — set on SpellDamage events (named spell, DS source,
+         DoT spell name).
+      3. First special — Headshot, Assassinate, Slay Undead, etc. —
+         when a special proc'd.
+      4. The melee verb, title-cased ('backstabs' -> 'Backstabs').
+      5. 'Melee' as a generic fallback.
     """
+    if getattr(h, 'pet_origin', None):
+        return h.pet_origin
     if h.spell:
         return h.spell
     if h.specials:
@@ -118,7 +130,11 @@ def _build_healing_block(e: Encounter, bucket_seconds: int,
             'damage': h.amount,            # reuse 'damage' key for UI helper
             'mods': list(h.modifiers),
             'spell': h.spell,
-            'source': h.spell or 'Heal',   # right-column group-by-source key
+            # If the heal was rewritten from a pet, show the pet's name
+            # as the source so the owner's healing breakdown still
+            # reveals which pet contributed.
+            'source': (getattr(h, 'pet_origin', None)
+                       or h.spell or 'Heal'),
         })
 
         agg = per_healer.setdefault(h.healer.lower(), {
@@ -202,14 +218,30 @@ def _build_healing_block(e: Encounter, bucket_seconds: int,
     }
 
 
-def _encounter_summary(e: Encounter) -> dict:
+def _encounter_summary(e: Encounter, manual_keysets: Optional[List[set]] = None
+                       ) -> dict:
     """Compact per-encounter row for the session list. Multi-target
     encounters get a `+N` suffix in the display name so the user knows
-    there were other mobs in the engagement."""
+    there were other mobs in the engagement.
+
+    `fight_keys` is the list of stable per-fight keys (target+start ISO)
+    backing this encounter, which the front-end uses when posting merge/
+    split actions. `is_manual` is True when this encounter's exact set of
+    fights matches a manual override from the sidecar — the UI shows a
+    badge so the user can tell auto-grouped from user-pinned rows."""
     name = e.name
     extras = e.target_count - 1
     if extras > 0:
         name = f'{name} +{extras}'
+    fkeys = []
+    for m in e.members:
+        k = fight_key(m.target, m.start)
+        if k is not None:
+            fkeys.append(k)
+    is_manual = False
+    if manual_keysets:
+        member_set = set(fkeys)
+        is_manual = any(member_set == ks for ks in manual_keysets)
     return {
         'encounter_id': e.encounter_id,
         'name': name,
@@ -221,6 +253,8 @@ def _encounter_summary(e: Encounter) -> dict:
         'fight_complete': e.fight_complete,
         'attacker_count': e.attacker_count,
         'member_count': len(e.members),
+        'fight_keys': fkeys,
+        'is_manual': is_manual,
     }
 
 
@@ -315,25 +349,108 @@ class _State:
     bucket_seconds: int = 5
     encounter_gap_seconds: int = 10
     heals_extend_fights: bool = False
+    # 0 = analyze the whole log; >0 = analyze only the last N hours of
+    # log activity (anchored to the log's last timestamp, NOT wall clock,
+    # so old logs work too). Default 8 covers a typical raid night while
+    # keeping the first parse fast on multi-day logs; users who want
+    # older data can bump this up or set it to 0.
+    since_hours: int = 8
     fights: Optional[List[FightResult]] = None
     heals: Optional[List[Heal]] = None
     encounters: Optional[List[Encounter]] = None
     parser_stats: Optional[dict] = None
+    # Sidecar state — pet owner assignments + manual encounter overrides.
+    # Loaded on _set_logfile, written on every edit endpoint.
+    sidecar: Optional[Sidecar] = None
+    # Parse-progress dict, updated periodically by the parser thread and
+    # read lock-free by /api/parse-status. State machine:
+    #   'idle'    — no parse in progress; pct meaningless.
+    #   'parsing' — currently walking the log; pct in [0, 100].
+    #   'done'    — finished cleanly; pct=100. Stays in this state until
+    #               the next reset.
+    #   'error'   — parse raised; `message` carries the reason.
+    parse_progress: dict = {
+        'state': 'idle', 'pct': 0.0,
+        'bytes_read': 0, 'total_bytes': 0,
+        'message': None,
+    }
     fights_lock = threading.Lock()
+
+
+def _set_progress(state: str, *, bytes_read: int = 0, total_bytes: int = 0,
+                  message: Optional[str] = None):
+    """Replace the progress dict atomically (single attribute assignment
+    is GIL-safe). `_State.parse_progress` is read lock-free from the
+    status endpoint so we never need to hold the fights lock here."""
+    pct = 0.0
+    if total_bytes > 0:
+        pct = max(0.0, min(100.0, bytes_read / total_bytes * 100.0))
+    if state == 'done':
+        pct = 100.0
+    _State.parse_progress = {
+        'state': state, 'pct': round(pct, 1),
+        'bytes_read': bytes_read, 'total_bytes': total_bytes,
+        'message': message,
+    }
+
+
+def _resolve_since_locked() -> Optional[datetime]:
+    """Translate `since_hours` into an absolute cutoff datetime by reading
+    the log's last timestamp. Anchoring to log-end (not wall clock) means
+    `since_hours=4` works on a log that ended yesterday, returning the
+    last 4h of recorded activity rather than nothing.
+
+    Caller must hold `_State.fights_lock`. Returns None when no slicing
+    should happen (since_hours == 0, log empty, or no parseable
+    timestamps in the tail)."""
+    if _State.since_hours <= 0 or _State.logfile is None:
+        return None
+    last = read_last_timestamp(_State.logfile)
+    if last is None:
+        return None
+    return last - timedelta(hours=_State.since_hours)
 
 
 def _ensure_combat_cached():
     """Walk the log once to populate fights + heals if not already cached.
-    Caller must hold `_State.fights_lock`."""
-    if _State.fights is None or _State.heals is None:
+    Caller must hold `_State.fights_lock`.
+
+    `_State.fights` and `_State.heals` are deliberately the RAW outputs
+    of `detect_combat` (no pet-owner rewrite). Rewriting happens later
+    in `_get_encounters_locked` so the raw attacker names stay visible
+    for the pet-owner edit modal. The cost is one extra pass per
+    sidecar edit; we trade a little CPU for a much simpler edit flow.
+
+    During the parse we update `_State.parse_progress` periodically so a
+    concurrent /api/parse-status request can show a live progress bar.
+    Sidecar edits don't trigger a re-parse (they only invalidate the
+    encounter cache), so the progress bar is only relevant on the first
+    load + reload + param change paths."""
+    if _State.fights is not None and _State.heals is not None:
+        return
+    since = _resolve_since_locked()
+    total = os.path.getsize(_State.logfile) if os.path.isfile(_State.logfile) else 0
+    _set_progress('parsing', bytes_read=0, total_bytes=total)
+
+    def _on_progress(bytes_read: int, total_bytes: int):
+        _set_progress('parsing', bytes_read=bytes_read,
+                      total_bytes=total_bytes)
+
+    try:
         fights, heals = detect_combat(
             _State.logfile,
             gap_seconds=_State.gap_seconds,
             min_damage=_State.min_damage,
             min_duration_seconds=_State.min_duration_seconds,
-            heals_extend_fights=_State.heals_extend_fights)
-        _State.fights = fights
-        _State.heals = heals
+            heals_extend_fights=_State.heals_extend_fights,
+            since=since,
+            progress_cb=_on_progress)
+    except Exception as e:
+        _set_progress('error', total_bytes=total, message=f'{type(e).__name__}: {e}')
+        raise
+    _State.fights = fights
+    _State.heals = heals
+    _set_progress('done', bytes_read=total, total_bytes=total)
 
 
 def _get_fights() -> List[FightResult]:
@@ -346,23 +463,39 @@ def _get_fights() -> List[FightResult]:
         return _State.fights
 
 
+def _get_encounters_locked() -> List[Encounter]:
+    """Lock-held variant of `_get_encounters`. Same lazy cache semantics
+    as `_get_fights`. Pet-owner rewrites and manual encounter overrides
+    are applied here so users can edit either without invalidating the
+    expensive log-parse cache. Caller must hold `_State.fights_lock`."""
+    if _State.logfile is None:
+        return []
+    _ensure_combat_cached()
+    if _State.encounters is None:
+        sidecar = _State.sidecar or Sidecar.empty()
+        if sidecar.pet_owners:
+            fights, heals = apply_pet_owners(
+                _State.fights, _State.heals, sidecar.pet_owners)
+        else:
+            fights, heals = _State.fights, _State.heals
+        _State.encounters = group_into_encounters(
+            fights,
+            gap_seconds=_State.encounter_gap_seconds,
+            heals=heals,
+            manual_groups=sidecar.manual_groups_for_grouper())
+    return _State.encounters
+
+
 def _get_encounters() -> List[Encounter]:
-    """Lazy-cache encounters built from the detected fights and the heal
-    stream. Same cache semantics as `_get_fights`."""
     with _State.fights_lock:
-        if _State.logfile is None:
-            return []
-        _ensure_combat_cached()
-        if _State.encounters is None:
-            _State.encounters = group_into_encounters(
-                _State.fights,
-                gap_seconds=_State.encounter_gap_seconds,
-                heals=_State.heals)
-        return _State.encounters
+        return _get_encounters_locked()
 
 
 def _set_logfile(path: str):
-    """Switch the active log. Validates and resets the cache."""
+    """Switch the active log. Validates, resets caches, and loads the
+    sidecar (`<logfile>.flurry.json`) if one exists. A missing or
+    unreadable sidecar yields an empty one — the file isn't created
+    until the user makes their first edit."""
     abs_path = os.path.abspath(os.path.expanduser(path))
     if not os.path.isfile(abs_path):
         raise FileNotFoundError(f'log file not found: {abs_path}')
@@ -372,6 +505,33 @@ def _set_logfile(path: str):
         _State.heals = None
         _State.encounters = None
         _State.parser_stats = None
+        _State.sidecar = load_sidecar(abs_path)
+    _set_progress('idle')
+
+
+def _invalidate_caches_locked(*, drop_combat: bool = False):
+    """Clear derived caches. Caller must hold `_State.fights_lock`.
+
+    `drop_combat=True` also drops the per-fight cache, forcing a re-walk
+    of the log on the next request — needed when pet ownership changes
+    so the rewritten attacker names propagate. Encounter-only edits
+    (manual groupings) drop just the encounters cache; the fights/heals
+    are unaffected."""
+    if drop_combat:
+        _State.fights = None
+        _State.heals = None
+        _State.parser_stats = None
+        # The next consumer will trigger a fresh parse; reset progress so
+        # the UI can show the new run from 0%.
+        _set_progress('idle')
+    _State.encounters = None
+
+
+def _persist_sidecar_locked():
+    """Atomic save of the active sidecar. Caller must hold the lock."""
+    if _State.logfile is None or _State.sidecar is None:
+        return
+    save_sidecar(_State.logfile, _State.sidecar)
 
 
 # Filenames are sanitized to a safe subset before being written to the
@@ -492,6 +652,12 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                     self.send_error(404, f'no fight with id {fid_str}')
                     return
                 self._serve_json(payload)
+            elif path == '/api/parse-status':
+                # Lock-free read of the progress dict — single attribute
+                # access, GIL-safe. Polled rapidly by the upload UI to
+                # animate a progress bar while a long parse runs in
+                # another request handler thread.
+                self._serve_json(_State.parse_progress)
             elif path == '/api/debug':
                 # Walk the log and report parser coverage. Cached because
                 # the walk is the same cost as detect_combat.
@@ -552,12 +718,15 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                 self._serve_json(self._session_payload())
             elif path == '/api/params':
                 # Update detection / grouping knobs and invalidate caches.
-                if _State.logfile is None:
-                    self.send_error(400, 'no log loaded')
-                    return
+                # Allowed without a log loaded so the picker can pre-set
+                # values like `since_hours` before the first parse — the
+                # cache invalidation is a no-op when there's nothing
+                # cached yet, and the values stick on `_State` for the
+                # eventual parse to pick up.
                 int_keys = ('gap_seconds', 'min_damage',
                             'min_duration_seconds',
-                            'encounter_gap_seconds', 'bucket_seconds')
+                            'encounter_gap_seconds', 'bucket_seconds',
+                            'since_hours')
                 bool_keys = ('heals_extend_fights',)
                 updates = {}
                 for key in int_keys:
@@ -578,22 +747,121 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                 with _State.fights_lock:
                     for k, v in updates.items():
                         setattr(_State, k, v)
-                    _State.fights = None
-                    _State.heals = None
-                    _State.encounters = None
-                    _State.parser_stats = None
+                    _invalidate_caches_locked(drop_combat=True)
                 self._serve_json(self._session_payload())
             elif path == '/api/reload':
                 # Re-parse the current log (picks up any new fights appended
-                # since last load). No-op if no log is loaded.
+                # since last load). No-op if no log is loaded. Sidecar is
+                # preserved so user edits survive a reload.
                 with _State.fights_lock:
                     if _State.logfile is None:
                         self.send_error(400, 'no log loaded')
                         return
-                    _State.fights = None
-                    _State.heals = None
-                    _State.encounters = None
-                    _State.parser_stats = None
+                    _invalidate_caches_locked(drop_combat=True)
+                self._serve_json(self._session_payload())
+            elif path == '/api/pet-owners':
+                # Set or clear pet-owner assignments. Two body shapes:
+                #   {"actor": "<actor>", "owner": "<owner>" | null}
+                #   {"updates": [{"actor": "...", "owner": "..." | null}, ...]}
+                # Owner null/empty clears that mapping. Batch shape lets
+                # the modal commit all dropdown changes in one POST so we
+                # only invalidate the encounter cache once for a multi-
+                # row edit. The rewrite happens at encounter-build time,
+                # so we never drop the (more expensive) fights cache.
+                if _State.logfile is None:
+                    self.send_error(400, 'no log loaded')
+                    return
+                if 'updates' in data:
+                    items = data.get('updates') or []
+                    if not isinstance(items, list):
+                        self.send_error(400, '"updates" must be a list')
+                        return
+                else:
+                    items = [{'actor': data.get('actor'),
+                              'owner': data.get('owner')}]
+                # Validate all items up-front so a bad entry mid-batch
+                # doesn't half-apply changes — sidecar mutations should
+                # be all-or-nothing from the user's perspective.
+                cleaned = []
+                for u in items:
+                    if not isinstance(u, dict):
+                        self.send_error(400, 'each update must be an object')
+                        return
+                    actor = u.get('actor')
+                    owner = u.get('owner')
+                    if not actor or not isinstance(actor, str):
+                        self.send_error(400, 'missing "actor" in update')
+                        return
+                    if owner is not None and not isinstance(owner, str):
+                        self.send_error(400, '"owner" must be a string or null')
+                        return
+                    cleaned.append((actor, owner))
+                with _State.fights_lock:
+                    if _State.sidecar is None:
+                        _State.sidecar = Sidecar.empty()
+                    for actor, owner in cleaned:
+                        _State.sidecar.set_pet_owner(actor, owner)
+                    _persist_sidecar_locked()
+                    _invalidate_caches_locked(drop_combat=False)
+                self._serve_json(self._session_payload())
+            elif path == '/api/encounters':
+                # Manual encounter override. Body:
+                #   {"action": "merge", "encounter_ids": [...], "name": null?}
+                #   {"action": "split", "encounter_ids": [...]}
+                # Encounter ids are resolved to stable fight keys against
+                # the *current* encounter list (held under the lock), so
+                # the wire format using ids is fine even though ids are
+                # unstable across param changes.
+                if _State.logfile is None:
+                    self.send_error(400, 'no log loaded')
+                    return
+                action = data.get('action')
+                if action not in ('merge', 'split'):
+                    self.send_error(400, '"action" must be "merge" or "split"')
+                    return
+                ids = data.get('encounter_ids') or []
+                if not isinstance(ids, list) or not all(isinstance(x, int) for x in ids):
+                    self.send_error(400, '"encounter_ids" must be a list of ints')
+                    return
+                with _State.fights_lock:
+                    if _State.sidecar is None:
+                        _State.sidecar = Sidecar.empty()
+                    encounters = _get_encounters_locked()
+                    by_id = {e.encounter_id: e for e in encounters}
+                    selected_keys = []
+                    for eid in ids:
+                        e = by_id.get(eid)
+                        if e is None:
+                            self.send_error(400, f'no encounter with id {eid}')
+                            return
+                        for m in e.members:
+                            k = fight_key(m.target, m.start)
+                            if k is not None:
+                                selected_keys.append(k)
+                    # Dedupe while preserving order so the stored list
+                    # reads naturally if anyone opens the sidecar by hand.
+                    seen = set()
+                    deduped = []
+                    for k in selected_keys:
+                        if k not in seen:
+                            seen.add(k)
+                            deduped.append(k)
+                    if action == 'merge':
+                        if len(deduped) < 2:
+                            self.send_error(400,
+                                'merge needs at least 2 fights across the selected encounters')
+                            return
+                        name = data.get('name')
+                        if name is not None and not isinstance(name, str):
+                            self.send_error(400, '"name" must be a string or null')
+                            return
+                        _State.sidecar.merge_encounter(deduped, name=name)
+                    else:  # split
+                        _State.sidecar.remove_keys_from_manual(deduped)
+                    _persist_sidecar_locked()
+                    # Pet-owner caches are unaffected by encounter edits;
+                    # only the encounter cache needs to drop.
+                    _invalidate_caches_locked(drop_combat=False)
                 self._serve_json(self._session_payload())
             else:
                 self.send_error(404)
@@ -621,40 +889,44 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _session_payload(self):
+        params = {
+            'gap_seconds': _State.gap_seconds,
+            'min_damage': _State.min_damage,
+            'min_duration_seconds': _State.min_duration_seconds,
+            'encounter_gap_seconds': _State.encounter_gap_seconds,
+            'bucket_seconds': _State.bucket_seconds,
+            'heals_extend_fights': _State.heals_extend_fights,
+            'since_hours': _State.since_hours,
+        }
         if _State.logfile is None:
             # No log loaded — UI shows the file picker.
             return {
                 'logfile': None,
                 'logfile_basename': None,
-                'params': {
-                    'gap_seconds': _State.gap_seconds,
-                    'min_damage': _State.min_damage,
-                    'min_duration_seconds': _State.min_duration_seconds,
-                    'encounter_gap_seconds': _State.encounter_gap_seconds,
-                    'bucket_seconds': _State.bucket_seconds,
-                    'heals_extend_fights': _State.heals_extend_fights,
-                },
+                'params': params,
                 'encounters': [],
                 'summary': None,
+                'pet_owners': {},
+                'manual_encounters': 0,
             }
         encounters = _get_encounters()
+        # Pre-compute the manual-encounter keysets once so the per-row
+        # `is_manual` flag is O(members) per row rather than O(members^2).
+        sidecar = _State.sidecar or Sidecar.empty()
+        manual_keysets = [set(m.fight_keys) for m in sidecar.manual_encounters]
         return {
             'logfile': _State.logfile,
             'logfile_basename': os.path.basename(_State.logfile),
-            'params': {
-                'gap_seconds': _State.gap_seconds,
-                'min_damage': _State.min_damage,
-                'min_duration_seconds': _State.min_duration_seconds,
-                'encounter_gap_seconds': _State.encounter_gap_seconds,
-                'bucket_seconds': _State.bucket_seconds,
-                'heals_extend_fights': _State.heals_extend_fights,
-            },
-            'encounters': [_encounter_summary(e) for e in encounters],
+            'params': params,
+            'encounters': [_encounter_summary(e, manual_keysets)
+                           for e in encounters],
             'summary': {
                 'total_encounters': len(encounters),
                 'total_killed': sum(1 for e in encounters if e.fight_complete),
                 'total_damage': sum(e.total_damage for e in encounters),
             },
+            'pet_owners': dict(sidecar.pet_owners),
+            'manual_encounters': len(sidecar.manual_encounters),
         }
 
     def _fight_payload(self, fight_id: int):
@@ -716,10 +988,23 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
         # below catches enemies (e.g. environmental AoE mobs like a Lava
         # Vortex) that deal damage but are never targeted back: their
         # damage lands almost entirely on friendlies, so that's the tell.
+        #
+        # We also fold in HEALING dispensed: a pure healer who only took
+        # AoE damage and never struck back (typical for cleric/druid
+        # mains in heavy raid content) would otherwise look like an
+        # enemy by the dealt-vs-received rule. Counting their healing
+        # output on the "active" side of the comparison fixes that.
+        # Enemies that heal themselves are unaffected: their incoming
+        # damage swamps any self-heal so received > dealt + healed
+        # still holds.
         damage_received = {}
         for m in e.members:
             key = m.target.lower()
             damage_received[key] = damage_received.get(key, 0) + m.total_damage
+        healing_dispensed = {}
+        for h in e.heals:
+            key = h.healer.lower()
+            healing_dispensed[key] = healing_dispensed.get(key, 0) + h.amount
         for a in payload['attackers']:
             name = a['attacker']
             if name.endswith('`s pet'):
@@ -727,7 +1012,8 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                 continue
             received = damage_received.get(name.lower(), 0)
             dealt = a['damage']
-            a['side'] = 'enemy' if received > dealt else 'friendly'
+            healed = healing_dispensed.get(name.lower(), 0)
+            a['side'] = 'enemy' if received > dealt + healed else 'friendly'
 
         # Per-attacker damage breakdown: who hit whom for how much, plus a
         # bucketed timeline series per pair AND the raw per-hit detail
@@ -796,6 +1082,12 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
         for a in payload['attackers']:
             if a['side'] == 'enemy':
                 continue
+            # An actor who healed in this encounter is decisively
+            # friendly — don't let stray damage flip them. Covers
+            # healers whose only "damage" is a damage-shield proc on
+            # the friendly tank when they were spell-buffed.
+            if healing_dispensed.get(a['attacker'].lower(), 0) > 0:
+                continue
             if a['attacker'].endswith('`s pet'):
                 continue
             to_friendlies = 0
@@ -816,6 +1108,43 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                          for a in payload['attackers']}
         payload['healing'] = _build_healing_block(
             e, bucket_seconds, payload['timeline']['labels'], sides_by_name)
+
+        # Pet-owner state — the front-end shows it in the per-attacker
+        # edit modal so the user can see (and clear) existing assignments.
+        # `raw_attackers` is the list of original (un-rewritten) attacker
+        # names visible across this encounter's RAW fights, sorted by
+        # damage desc. The modal uses this as its candidate list — the
+        # rewritten `attackers` array above hides the original names so
+        # we need a separate channel. Each raw attacker carries a `side`
+        # so the owner dropdown can filter to plausible candidates
+        # (friendly pet → friendly owners, enemy pet → enemy owners).
+        sidecar = _State.sidecar or Sidecar.empty()
+        payload['pet_owners'] = dict(sidecar.pet_owners)
+        member_keys = {fight_key(m.target, m.start) for m in e.members}
+        raw_totals: dict = {}
+        for rf in (_State.fights or []):
+            if fight_key(rf.target, rf.start) in member_keys:
+                for atk_name, s in rf.stats_by_attacker.items():
+                    raw_totals[atk_name] = raw_totals.get(atk_name, 0) + s.damage
+        # `damage_received` is keyed by lowercased TARGET name and was
+        # built above; targets aren't rewritten so it works for raw
+        # actors too. Compare dealt vs received the same way the
+        # rewritten attackers do — this is the "basic" classifier
+        # without the pass-2 refinement, which is fine here because
+        # the dropdown is just suggesting candidates, not making
+        # downstream decisions.
+        raw_attackers = []
+        for name, dmg in raw_totals.items():
+            if _is_corpse(name):
+                continue
+            if name.endswith('`s pet'):
+                side = 'friendly'
+            else:
+                received = damage_received.get(name.lower(), 0)
+                side = 'enemy' if received > dmg else 'friendly'
+            raw_attackers.append({'attacker': name, 'damage': dmg, 'side': side})
+        raw_attackers.sort(key=lambda x: x['damage'], reverse=True)
+        payload['raw_attackers'] = raw_attackers
         return payload
 
 
@@ -836,6 +1165,7 @@ def serve(logfile: Optional[str] = None,
           bucket_seconds: int = 5,
           encounter_gap_seconds: int = 10,
           heals_extend_fights: bool = False,
+          since_hours: int = 8,
           open_browser: bool = True):
     """Start the local UI server. Blocks until Ctrl-C.
 
@@ -847,12 +1177,15 @@ def serve(logfile: Optional[str] = None,
     _State.heals = None
     _State.encounters = None
     _State.parser_stats = None
+    _State.sidecar = None
     _State.gap_seconds = gap_seconds
     _State.min_damage = min_damage
     _State.min_duration_seconds = min_duration_seconds
     _State.bucket_seconds = bucket_seconds
     _State.encounter_gap_seconds = encounter_gap_seconds
     _State.heals_extend_fights = heals_extend_fights
+    _State.since_hours = since_hours
+    _set_progress('idle')
     if logfile is not None:
         _set_logfile(logfile)
 
@@ -1064,6 +1397,84 @@ _INDEX_HTML = r'''<!DOCTYPE html>
   .source-row.active td { background: var(--row); color: var(--accent);
                           font-weight: 600; }
 
+  /* Manual-encounter pin badge in the session table */
+  .pin-badge { display: inline-block; margin-left: 6px;
+               padding: 1px 6px; border-radius: 3px;
+               font-size: 0.65rem; font-weight: 700; letter-spacing: 0.04em;
+               text-transform: uppercase;
+               background: rgba(96, 165, 250, 0.18); color: var(--accent); }
+
+  /* Selection action bar above the session table. Only rendered when at
+     least one encounter row is selected; the buttons themselves disable
+     based on minimum-count rules (merge needs 2+, etc.). */
+  .action-bar { display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+                margin-bottom: 12px; background: var(--row);
+                border: 1px solid var(--border); border-radius: 6px;
+                font-size: 0.9rem; }
+  .action-bar .count { color: var(--text-bright); font-weight: 600;
+                       margin-right: auto; }
+  .action-bar .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .action-bar .help { color: var(--text-dim); font-size: 0.8rem; }
+
+  /* Per-row checkbox column. The label fills the whole cell so anywhere
+     in the cell area is a click target, not just the tiny native widget.
+     Padding 0 on the cell + display:flex on the label expands the hit
+     box to ~28px × full row height. */
+  .check-cell { width: 36px; padding: 0; }
+  .check-cell label.check-hit { display: flex; align-items: center;
+                                justify-content: center;
+                                width: 100%; height: 100%;
+                                padding: 8px 10px; cursor: pointer;
+                                margin: 0; }
+  .check-cell input[type="checkbox"] { accent-color: var(--accent);
+                                       cursor: pointer; pointer-events: none; }
+
+  /* Pet-owner edit modal */
+  .modal.pets-modal { max-width: 720px; }
+  /* Header-action row hosts the [Save] [×] pair top-right. The close
+     button keeps its existing static styling (font-size, color); we
+     just override its absolute positioning so it lays out as a sibling
+     of Save inside the flex container. */
+  .pets-modal-actions { position: absolute; top: 8px; right: 12px;
+                        display: flex; gap: 8px; align-items: center; }
+  .pets-modal-actions .modal-close { position: static; top: auto;
+                                     right: auto; }
+  .pets-help { color: var(--text-dim); font-size: 0.85rem;
+               line-height: 1.5; margin-bottom: 16px; }
+  .pets-help code { background: var(--row); padding: 1px 6px;
+                    border-radius: 3px; font-size: 0.85em; }
+  .pets-table { width: 100%; font-size: 0.9rem;
+                border-collapse: collapse; }
+  .pets-table th { color: var(--text-dim); font-weight: 600;
+                   font-size: 0.72rem; text-transform: uppercase;
+                   letter-spacing: 0.04em; padding: 6px 8px;
+                   text-align: left; border-bottom: 1px solid var(--border); }
+  .pets-table td { padding: 8px; border-bottom: 1px solid var(--border); }
+  .pets-table td.num { text-align: right;
+                       font-variant-numeric: tabular-nums; }
+  .pets-table .actor { color: var(--text-bright); }
+  .pets-table .owner-input { background: var(--row); color: var(--text);
+                             border: 1px solid var(--border);
+                             padding: 4px 8px; border-radius: 4px;
+                             font-family: inherit; font-size: 0.9rem;
+                             width: 100%; }
+  .pets-table .owner-input:focus { outline: none;
+                                   border-color: var(--accent); }
+  .pets-table .side-tag { display: inline-block; margin-left: 6px;
+                          padding: 1px 6px; border-radius: 3px;
+                          font-size: 0.65rem; font-weight: 700;
+                          letter-spacing: 0.04em; text-transform: uppercase;
+                          vertical-align: middle; }
+  .pets-table .side-tag.friendly { background: rgba(52, 211, 153, 0.18);
+                                   color: var(--good); }
+  .pets-table .side-tag.enemy { background: rgba(248, 113, 113, 0.18);
+                                color: var(--bad); }
+  .pets-table .row-actions { white-space: nowrap; text-align: right; }
+  .pets-table .row-actions .btn { font-size: 0.8rem;
+                                  padding: 4px 10px; margin-left: 4px; }
+  .pets-current-list { margin-top: 16px; font-size: 0.85rem; }
+  .pets-current-list .sub { color: var(--text-dim); }
+
   /* Damage/Healing tabs above encounter detail content */
   .tabs { display: flex; gap: 4px; margin: 8px 0 16px;
           border-bottom: 1px solid var(--border); }
@@ -1142,6 +1553,20 @@ _INDEX_HTML = r'''<!DOCTYPE html>
   .btn.primary:hover { filter: brightness(1.1); }
 
   /* File picker */
+  .picker-options { display: flex; align-items: center; gap: 14px;
+                    margin-bottom: 12px; padding: 10px 14px;
+                    background: var(--row);
+                    border: 1px solid var(--border); border-radius: 6px; }
+  .picker-options label { display: flex; flex-direction: column; gap: 4px;
+                          font-size: 0.75rem; color: var(--text-dim);
+                          text-transform: uppercase; letter-spacing: 0.04em; }
+  .picker-options input[type="number"] {
+                          background: var(--bg); color: var(--text);
+                          border: 1px solid var(--border); padding: 6px 10px;
+                          border-radius: 4px; font-size: 0.9rem; width: 100px;
+                          font-variant-numeric: tabular-nums; font-family: inherit; }
+  .picker-options input:focus { outline: none; border-color: var(--accent); }
+  .picker-options-help { font-size: 0.8rem; flex: 1; line-height: 1.45; }
   .picker-path {
     font-family: ui-monospace, 'SF Mono', Consolas, monospace;
     font-size: 0.85rem; color: var(--text-dim); padding: 6px 10px;
@@ -1207,11 +1632,89 @@ const COLORS = [
 
 let chartInstance = null;
 let sessionSort = { key: 'encounter_id', dir: 'desc' };
+// Selected encounter ids in the session table. Persists across sort
+// re-renders (the user can sort while keeping their selection) but is
+// cleared on a fresh `renderSession` since ids may have shifted.
+let sessionSelected = new Set();
 
 async function fetchJSON(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   return r.json();
+}
+
+// --- Parse-progress polling ------------------------------------------
+//
+// `/api/parse-status` reports the current parse_progress dict. While a
+// long log walk is happening in another request handler thread, callers
+// poll this and reflect bytes_read/total_bytes onto a progress UI. The
+// poll stops as soon as the calling action (the request whose handler
+// triggered the parse) resolves — we don't try to detect 'done' from
+// the status alone because the cache might be filled by a still-in-
+// flight request whose response hasn't propagated yet.
+
+function fmtMB(bytes) {
+  if (bytes == null || bytes <= 0) return '0 MB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function parseProgressHTML(s, headline = 'Parsing log…') {
+  const pct = (s && s.state === 'parsing') ? s.pct : 0;
+  const sizeNote = (s && s.total_bytes > 0)
+    ? `<strong>${fmtMB(s.bytes_read)}</strong> / ${fmtMB(s.total_bytes)}`
+    : '';
+  const pctNote = (s && s.state === 'parsing') ? `${pct.toFixed(1)}%` : '';
+  return `
+    <div class="upload-status">
+      <div class="upload-label">${headline} ${sizeNote}</div>
+      <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
+      <div class="upload-pct sub">${pctNote}</div>
+    </div>`;
+}
+
+// Start a poller that calls onTick(status) every interval. Returns a
+// stop() function. First tick fires immediately (the await in the
+// initial fetch yields control, so the caller's own fetch can still
+// race the status fetch).
+function startParsePoll(onTick, intervalMs = 250) {
+  let stopped = false;
+  let timer = null;
+  async function tick() {
+    if (stopped) return;
+    try {
+      const r = await fetch('/api/parse-status');
+      if (r.ok) {
+        const s = await r.json();
+        if (!stopped) onTick(s);
+      }
+    } catch (e) { /* network blip — keep polling */ }
+    if (!stopped) timer = setTimeout(tick, intervalMs);
+  }
+  tick();
+  return () => { stopped = true; if (timer) clearTimeout(timer); };
+}
+
+// Show parse-progress UI in `app` while `promiseFactory()` runs. The
+// progress overlay is only swapped in if the server reports
+// state==='parsing' — a warm cache shows nothing, no flicker.
+async function withParseProgress(promiseFactory, app, headline) {
+  const placeholder = `<div class="sub">Loading…</div>`;
+  app.innerHTML = placeholder;
+  let showingProgress = false;
+  const stop = startParsePoll(s => {
+    if (s.state === 'parsing') {
+      app.innerHTML = parseProgressHTML(s, headline);
+      showingProgress = true;
+    }
+  });
+  try {
+    return await promiseFactory();
+  } finally {
+    stop();
+    // If we did show the parse UI, leave it there for the caller's
+    // post-fetch swap. If we didn't, the placeholder is unchanged.
+    void showingProgress;
+  }
 }
 
 function setHeader(title, sub, hasLog) {
@@ -1279,13 +1782,22 @@ async function renderPicker(path) {
             'Browse, paste a path, or drag a log file anywhere on the page',
             false);
 
+  // Fetch current params alongside the dir listing so the "Last N hours"
+  // input can prefill — the picker is the right place to set the slice
+  // BEFORE the initial parse, not after it.
   const url = path ? `/api/browse?path=${encodeURIComponent(path)}` : '/api/browse';
-  let data;
-  try { data = await fetchJSON(url); }
-  catch (e) {
+  let data, sessionParams;
+  try {
+    [data, sessionParams] = await Promise.all([
+      fetchJSON(url),
+      fetchJSON('/api/session').then(s => s.params || {}).catch(() => ({})),
+    ]);
+  } catch (e) {
     app.innerHTML = `<div class="err">Could not list ${escapeHTML(path || '')}: ${e.message}</div>` +
+                    pickerOptionsHTML({since_hours: 0}) +
                     pickerInputHTML('');
     wirePickerInput();
+    wirePickerOptions();
     return;
   }
 
@@ -1315,6 +1827,7 @@ async function renderPicker(path) {
     <div class="panel">
       <div class="picker-path">${escapeHTML(data.path)}</div>
       <div style="margin-bottom: 12px;">${parentLink}</div>
+      ${pickerOptionsHTML(sessionParams)}
       ${pickerInputHTML(data.path)}
       ${(dirRows || fileRows) ? `
         <table>
@@ -1338,6 +1851,49 @@ async function renderPicker(path) {
     el.addEventListener('click', () => openLog(el.dataset.open));
   });
   wirePickerInput();
+  wirePickerOptions();
+}
+
+function pickerOptionsHTML(params) {
+  // Pre-parse knobs the user can set before opening a log. Only
+  // since_hours for now — others (gap, min damage, etc.) are easier to
+  // tune iteratively from the params panel after a first load.
+  const sinceHours = (params && typeof params.since_hours === 'number')
+    ? params.since_hours : 0;
+  return `
+    <div class="picker-options">
+      <label>Last N hours
+        <input type="number" id="picker-since-hours" min="0" step="1"
+               value="${sinceHours}"
+               title="Analyze only the last N hours of log activity, anchored to the log's last timestamp. 0 = whole log. Big speedup on multi-day logs.">
+      </label>
+      <span class="sub picker-options-help">
+        Set this before opening a long log to skip parsing the prefix —
+        a 24h window on a multi-day log can be 10× faster.
+      </span>
+    </div>`;
+}
+
+function wirePickerOptions() {
+  const sinceInput = document.getElementById('picker-since-hours');
+  if (!sinceInput) return;
+  // POST to /api/params on commit (Enter, blur, or step click). We use
+  // 'change' rather than 'input' so we don't spam the server on every
+  // keystroke — and so the value is final by the time we navigate.
+  sinceInput.addEventListener('change', async () => {
+    const v = parseInt(sinceInput.value, 10);
+    if (Number.isNaN(v) || v < 0) {
+      sinceInput.value = 0;
+      return;
+    }
+    try {
+      await fetch('/api/params', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({since_hours: v}),
+      });
+    } catch (e) { /* leave value, error surfaces on next action */ }
+  });
 }
 
 function pickerInputHTML(currentPath) {
@@ -1382,13 +1938,18 @@ function joinPath(parent, name) {
 async function openLog(path) {
   if (!path) return;
   const app = document.getElementById('app');
-  app.innerHTML = '<div class="sub">Loading log…</div>';
+  // /api/open triggers the first parse synchronously inside the request
+  // handler (its response includes the encounter list). Wrap the fetch
+  // with parse-progress polling so the bar shows over the picker UI
+  // while the parse is running on the server-side handler thread.
   try {
-    const r = await fetch('/api/open', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({path}),
-    });
+    const r = await withParseProgress(
+      () => fetch('/api/open', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({path}),
+      }),
+      app, 'Loading log…');
     if (!r.ok) {
       const txt = await r.text();
       app.innerHTML = `<div class="err">Failed to open: ${escapeHTML(txt)}</div>`;
@@ -1422,11 +1983,15 @@ function compareFights(a, b, key, dir) {
 async function renderSession() {
   if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
   const app = document.getElementById('app');
-  app.innerHTML = '<div class="sub">Loading…</div>';
 
   let data;
-  try { data = await fetchJSON('/api/session'); }
-  catch (e) { app.innerHTML = `<div class="err">Failed to load session: ${e.message}</div>`; return; }
+  try {
+    data = await withParseProgress(
+      () => fetchJSON('/api/session'), app, 'Parsing log…');
+  } catch (e) {
+    app.innerHTML = `<div class="err">Failed to load session: ${e.message}</div>`;
+    return;
+  }
 
   // No log loaded → bounce straight to the picker.
   if (data.logfile === null) {
@@ -1434,8 +1999,11 @@ async function renderSession() {
     return;
   }
 
+  const sinceLabel = data.params.since_hours > 0
+    ? `last ${data.params.since_hours}h`
+    : 'whole log';
   setHeader(data.logfile_basename,
-            `min between fights ${data.params.gap_seconds}s · min between encounters ${data.params.encounter_gap_seconds}s · min damage ${NUM(data.params.min_damage)}`,
+            `${sinceLabel} · min between fights ${data.params.gap_seconds}s · min between encounters ${data.params.encounter_gap_seconds}s · min damage ${NUM(data.params.min_damage)}`,
             true);
 
   const s = data.summary;
@@ -1482,6 +2050,11 @@ async function renderSession() {
                  value="${data.params.encounter_gap_seconds}"
                  title="Adjacent fights separated by less than this much downtime stay in the same encounter (default 10, 0 = strict overlap only).">
         </label>
+        <label>Last N hours
+          <input type="number" id="param-since-hours" min="0" step="1"
+                 value="${data.params.since_hours}"
+                 title="Analyze only the last N hours of log activity, anchored to the log's last timestamp. 0 = whole log (default). Big speedup on multi-day logs.">
+        </label>
         <label class="check"
                title="When on, heal events count as combat activity and keep in-progress fights alive across no-damage gaps. Heals outside any fight still don't open new ones.">
           <input type="checkbox" id="param-heals-extend"
@@ -1513,29 +2086,76 @@ async function renderSession() {
     { key: 'fight_complete',   label: 'Status',    num: false, defaultDir: 'desc' },
   ];
 
+  // Drop any selections that no longer correspond to a current encounter
+  // id. New session payloads (param change, log switch, manual edit) can
+  // shift ids around, so stale selections shouldn't trigger merge/split
+  // against unrelated encounters.
+  const validIds = new Set(data.encounters.map(e => e.encounter_id));
+  for (const id of Array.from(sessionSelected)) {
+    if (!validIds.has(id)) sessionSelected.delete(id);
+  }
+
+  function renderActionBar() {
+    const n = sessionSelected.size;
+    if (n === 0) return '';
+    const mergeDisabled = n < 2 ? ' disabled' : '';
+    return `
+      <div class="action-bar" id="action-bar">
+        <span class="count">${n} selected</span>
+        <button class="btn primary" id="act-merge"${mergeDisabled}
+                title="Combine the selected encounters into one user-pinned encounter.">Merge</button>
+        <button class="btn" id="act-split"
+                title="Remove these encounters from any manual groupings, returning them to auto-grouped state.">Split</button>
+        <button class="btn" id="act-clear"
+                title="Clear the selection.">Clear</button>
+      </div>`;
+  }
+
+  function refreshActionBar() {
+    const slot = document.getElementById('action-bar-slot');
+    if (slot) slot.innerHTML = renderActionBar();
+    wireActionBar();
+  }
+
   function renderTablePanel() {
     const sorted = data.encounters.slice().sort((a, b) =>
       compareFights(a, b, sessionSort.key, sessionSort.dir));
 
-    const headerHTML = COLS.map(c => {
-      const arrow = sessionSort.key === c.key
-        ? `<span class="sort-arrow">${sessionSort.dir === 'desc' ? '▼' : '▲'}</span>`
-        : '';
-      return `<th class="sortable${c.num ? ' num' : ''}" data-key="${c.key}">${c.label}${arrow}</th>`;
-    }).join('');
+    const headerHTML =
+      `<th class="check-cell">
+         <label class="check-hit" title="Toggle all encounters">
+           <input type="checkbox" id="check-all">
+         </label>
+       </th>` +
+      COLS.map(c => {
+        const arrow = sessionSort.key === c.key
+          ? `<span class="sort-arrow">${sessionSort.dir === 'desc' ? '▼' : '▲'}</span>`
+          : '';
+        return `<th class="sortable${c.num ? ' num' : ''}" data-key="${c.key}">${c.label}${arrow}</th>`;
+      }).join('');
 
-    const rows = sorted.map(e => `
+    const rows = sorted.map(e => {
+      const checked = sessionSelected.has(e.encounter_id) ? ' checked' : '';
+      const pin = e.is_manual ? '<span class="pin-badge" title="User-pinned encounter">★ pinned</span>' : '';
+      return `
       <tr class="fight-row" data-id="${e.encounter_id}">
+        <td class="check-cell">
+          <label class="check-hit">
+            <input type="checkbox" class="row-check"
+                   data-id="${e.encounter_id}"${checked}>
+          </label>
+        </td>
         <td class="num">${e.encounter_id}</td>
         <td>${e.start}</td>
         <td class="num">${FMT_DUR(e.duration_seconds)}</td>
-        <td class="target">${escapeHTML(e.name)}</td>
+        <td class="target">${escapeHTML(e.name)}${pin}</td>
         <td class="num">${NUM(e.total_damage)}</td>
         <td class="num">${NUM(e.raid_dps)}</td>
         <td class="num">${e.attacker_count}</td>
         <td class="status ${e.fight_complete ? 'killed' : 'incomplete'}">
           ${e.fight_complete ? 'Killed' : 'Incomplete'}</td>
-      </tr>`).join('');
+      </tr>`;
+    }).join('');
 
     return `
       <div class="panel" id="fight-table-panel">
@@ -1563,6 +2183,42 @@ async function renderSession() {
         }
       });
     });
+
+    // Stop propagation on the cell-spanning label so clicks anywhere
+    // in the check-cell toggle the checkbox without also triggering
+    // row-click navigation. The label's `for`-less wrapping of the
+    // input makes the input toggle automatically; pointer-events on
+    // the input are disabled in CSS so all clicks land on the label.
+    app.querySelectorAll('td.check-cell').forEach(td => {
+      td.addEventListener('click', ev => ev.stopPropagation());
+    });
+    app.querySelectorAll('input.row-check').forEach(cb => {
+      cb.addEventListener('change', () => {
+        const id = parseInt(cb.dataset.id, 10);
+        if (cb.checked) sessionSelected.add(id);
+        else sessionSelected.delete(id);
+        refreshActionBar();
+        syncCheckAll();
+      });
+    });
+
+    // Header checkbox: select-all/none of the *currently visible* rows.
+    const checkAll = document.getElementById('check-all');
+    if (checkAll) {
+      syncCheckAll();
+      checkAll.addEventListener('change', () => {
+        app.querySelectorAll('input.row-check').forEach(cb => {
+          const id = parseInt(cb.dataset.id, 10);
+          cb.checked = checkAll.checked;
+          if (checkAll.checked) sessionSelected.add(id);
+          else sessionSelected.delete(id);
+        });
+        refreshActionBar();
+      });
+    }
+
+    // Row click navigates — but only when the click didn't originate on
+    // the checkbox cell, which has its own stopPropagation handler.
     app.querySelectorAll('tr.fight-row').forEach(tr => {
       tr.addEventListener('click', () => {
         location.hash = `#/encounter/${tr.dataset.id}`;
@@ -1570,9 +2226,74 @@ async function renderSession() {
     });
   }
 
-  app.innerHTML = summaryHTML + paramsHTML + renderTablePanel();
+  function syncCheckAll() {
+    const checkAll = document.getElementById('check-all');
+    if (!checkAll) return;
+    const rowChecks = app.querySelectorAll('input.row-check');
+    if (rowChecks.length === 0) {
+      checkAll.checked = false;
+      checkAll.indeterminate = false;
+      return;
+    }
+    const checked = Array.from(rowChecks).filter(cb => cb.checked).length;
+    checkAll.checked = checked === rowChecks.length;
+    checkAll.indeterminate = checked > 0 && checked < rowChecks.length;
+  }
+
+  function wireActionBar() {
+    const merge = document.getElementById('act-merge');
+    const split = document.getElementById('act-split');
+    const clear = document.getElementById('act-clear');
+    if (clear) clear.addEventListener('click', () => {
+      sessionSelected.clear();
+      app.querySelectorAll('input.row-check').forEach(cb => { cb.checked = false; });
+      refreshActionBar();
+      syncCheckAll();
+    });
+    if (merge) merge.addEventListener('click', () => postEncounterAction('merge'));
+    if (split) split.addEventListener('click', () => postEncounterAction('split'));
+  }
+
+  app.innerHTML = summaryHTML + paramsHTML +
+    `<div id="action-bar-slot">${renderActionBar()}</div>` +
+    renderTablePanel();
   wireParamsPanel();
   wireTablePanel();
+  wireActionBar();
+}
+
+async function postEncounterAction(action) {
+  const ids = Array.from(sessionSelected);
+  if (ids.length === 0) return;
+  if (action === 'merge' && ids.length < 2) return;
+  const merge = document.getElementById('act-merge');
+  const split = document.getElementById('act-split');
+  // Disable both buttons while the request is in flight so a double-click
+  // doesn't double-submit. The full re-render at the end resets state.
+  if (merge) merge.disabled = true;
+  if (split) split.disabled = true;
+  try {
+    const r = await fetch('/api/encounters', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action, encounter_ids: ids}),
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      alert(`${action} failed: ${txt}`);
+      return;
+    }
+    // Encounter ids shift after merge/split, so wipe the selection and
+    // do a full reroute instead of a partial in-place update.
+    sessionSelected.clear();
+    location.hash = '#/';
+    route();
+  } catch (e) {
+    alert(`${action} failed: ${e.message}`);
+  } finally {
+    if (merge) merge.disabled = false;
+    if (split) split.disabled = false;
+  }
 }
 
 async function wireParamsPanel() {
@@ -1587,6 +2308,7 @@ async function wireParamsPanel() {
       min_damage: parseInt(document.getElementById('param-min-damage').value, 10),
       min_duration_seconds: parseInt(document.getElementById('param-min-duration').value, 10),
       encounter_gap_seconds: parseInt(document.getElementById('param-encounter-gap').value, 10),
+      since_hours: parseInt(document.getElementById('param-since-hours').value, 10),
     };
     if (Object.values(ints).some(v => Number.isNaN(v) || v < 0)) {
       msg.textContent = 'Values must be non-negative integers.';
@@ -1628,11 +2350,15 @@ async function wireParamsPanel() {
 async function renderDebug() {
   if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
   const app = document.getElementById('app');
-  app.innerHTML = '<div class="sub">Walking log…</div>';
 
   let data;
-  try { data = await fetchJSON('/api/debug'); }
-  catch (e) { app.innerHTML = `<div class="err">Failed to load debug stats: ${e.message}</div>`; return; }
+  try {
+    data = await withParseProgress(
+      () => fetchJSON('/api/debug'), app, 'Walking log…');
+  } catch (e) {
+    app.innerHTML = `<div class="err">Failed to load debug stats: ${e.message}</div>`;
+    return;
+  }
 
   setHeader('Parser coverage',
             `${NUM(data.total_lines)} lines · ${NUM(data.unknown_total_lines)} unparsed`,
@@ -1694,17 +2420,35 @@ async function renderDebug() {
 async function renderEncounter(id) {
   if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
   const app = document.getElementById('app');
-  app.innerHTML = '<div class="sub">Loading…</div>';
 
   let f;
-  try { f = await fetchJSON(`/api/encounter/${id}`); }
-  catch (e) { app.innerHTML = `<div class="err">Failed to load encounter ${id}: ${e.message}</div>`; return; }
+  try {
+    f = await withParseProgress(
+      () => fetchJSON(`/api/encounter/${id}`), app, 'Parsing log…');
+  } catch (e) {
+    app.innerHTML = `<div class="err">Failed to load encounter ${id}: ${e.message}</div>`;
+    return;
+  }
 
   setHeader(`#${f.encounter_id} · ${f.name || f.target}`,
             `${f.start} → ${f.end} · ${FMT_DUR(f.duration_seconds)} · ` +
             (f.fight_complete ? 'Killed' : 'Incomplete') +
             (f.member_count > 1 ? ` · ${f.member_count} fights merged` : ''),
             true);
+  // Add an extra "Pet owners" button to the header actions. setHeader has
+  // already populated Refresh/Change log; we append after them so the
+  // primary nav stays leftmost.
+  const headerActions = document.getElementById('actions');
+  if (headerActions) {
+    const petsBtn = document.createElement('button');
+    petsBtn.className = 'btn';
+    petsBtn.textContent = 'Pet owners';
+    const ownerCount = Object.keys(f.pet_owners || {}).length;
+    if (ownerCount > 0) petsBtn.textContent += ` (${ownerCount})`;
+    petsBtn.title = 'Assign owners to actors that don\'t carry the backtick-pet suffix in the log.';
+    petsBtn.addEventListener('click', () => showPetOwnersModal(f));
+    headerActions.appendChild(petsBtn);
+  }
 
   const summaryHTML = `
     <a href="#/" class="back">← back</a>
@@ -2451,6 +3195,220 @@ function showPairChart(pair, labels, bucketSeconds) {
   refresh();
 }
 
+function showPetOwnersModal(encounter) {
+  // List the encounter's RAW attacker names alongside any existing pet-
+  // owner mapping. Each row has an inline owner input + Save/Clear; the
+  // user can assign a new owner, change an existing one, or clear back
+  // to no mapping. Saves are per-row to keep the wire format simple.
+  const existing = document.getElementById('pets-modal');
+  if (existing) existing.remove();
+
+  const petOwners = Object.assign({}, encounter.pet_owners || {});
+  const rawAttackers = encounter.raw_attackers || [];
+  // Map raw attacker names by lowercase for the input prefill (the
+  // sidecar matches case-insensitively but stores the casing the user
+  // first saved). Pre-bin candidate owners by side so each row's
+  // dropdown only shows plausible owners — friendly pet → friendly
+  // owners, enemy pet → enemy owners.
+  const ownerByActorLo = {};
+  for (const k of Object.keys(petOwners)) {
+    ownerByActorLo[k.toLowerCase()] = petOwners[k];
+  }
+  const candidatesBySide = {friendly: [], enemy: []};
+  for (const a of rawAttackers) {
+    if (a.attacker.endsWith('`s pet') || a.attacker.endsWith("'s pet")) continue;
+    const side = a.side === 'enemy' ? 'enemy' : 'friendly';
+    if (candidatesBySide[side].indexOf(a.attacker) === -1) {
+      candidatesBySide[side].push(a.attacker);
+    }
+  }
+
+  // Sort raw attackers: those with a current mapping first, then by
+  // damage desc. Makes the "what's currently set" answer obvious.
+  const sortedRaw = rawAttackers.slice().sort((a, b) => {
+    const am = ownerByActorLo[a.attacker.toLowerCase()] ? 1 : 0;
+    const bm = ownerByActorLo[b.attacker.toLowerCase()] ? 1 : 0;
+    if (am !== bm) return bm - am;
+    return b.damage - a.damage;
+  });
+
+  const rowHTML = (a) => {
+    const cur = ownerByActorLo[a.attacker.toLowerCase()] || '';
+    const safeActor = escapeHTML(a.attacker);
+    const side = a.side === 'enemy' ? 'enemy' : 'friendly';
+    // The actor itself shouldn't be a candidate owner (would create a
+    // self-loop). If the current saved owner isn't among the candidates
+    // (e.g. an enemy chosen as a friendly's owner because the user knew
+    // something the side classifier didn't), include it as a one-off so
+    // the row still shows the correct value.
+    const candidates = candidatesBySide[side]
+      .filter(n => n.toLowerCase() !== a.attacker.toLowerCase());
+    if (cur && candidates.findIndex(n => n.toLowerCase() === cur.toLowerCase()) === -1) {
+      candidates.unshift(cur);
+    }
+    const sideTag = side === 'enemy'
+      ? ' <span class="side-tag enemy">enemy</span>'
+      : ' <span class="side-tag friendly">friendly</span>';
+    const opts = `<option value="">(no owner)</option>` +
+      candidates.map(n => {
+        const sel = n.toLowerCase() === cur.toLowerCase() ? ' selected' : '';
+        return `<option value="${escapeHTML(n)}"${sel}>${escapeHTML(n)}</option>`;
+      }).join('');
+    return `
+      <tr data-actor="${safeActor}">
+        <td class="actor">${safeActor}${sideTag}</td>
+        <td class="num">${NUM(a.damage)}</td>
+        <td><select class="owner-input">${opts}</select></td>
+        <td class="row-actions">
+          <button class="btn owner-clear">Clear</button>
+        </td>
+      </tr>`;
+  };
+
+  // Any owners assigned to actors NOT in this encounter are listed below
+  // the table so the user can still see and clear them. Without this,
+  // an assignment made on one encounter would be invisible from any
+  // other encounter that doesn't include the same actor.
+  const presentLo = new Set(rawAttackers.map(a => a.attacker.toLowerCase()));
+  const otherOwners = Object.entries(petOwners)
+    .filter(([actor]) => !presentLo.has(actor.toLowerCase()));
+  const otherHTML = otherOwners.length === 0 ? '' : `
+    <div class="pets-current-list">
+      <h4>Other assignments (not in this encounter)</h4>
+      <table class="pets-table">
+        <thead><tr>
+          <th>Actor</th><th>Owner</th><th class="row-actions"></th>
+        </tr></thead>
+        <tbody>
+          ${otherOwners.map(([actor, owner]) => `
+            <tr data-actor="${escapeHTML(actor)}">
+              <td class="actor">${escapeHTML(actor)}</td>
+              <td>${escapeHTML(owner)}</td>
+              <td class="row-actions">
+                <button class="btn owner-clear-other">Clear</button>
+              </td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+
+  const tableHTML = sortedRaw.length === 0
+    ? '<div class="sub">No attackers in this encounter.</div>'
+    : `
+      <table class="pets-table">
+        <thead><tr>
+          <th>Actor</th>
+          <th class="num">Damage in encounter</th>
+          <th>Owner</th>
+          <th class="row-actions"></th>
+        </tr></thead>
+        <tbody>${sortedRaw.map(rowHTML).join('')}</tbody>
+      </table>`;
+
+  const modal = document.createElement('div');
+  modal.id = 'pets-modal';
+  modal.className = 'modal-backdrop';
+  modal.innerHTML = `
+    <div class="modal pets-modal">
+      <div class="pets-modal-actions">
+        <button class="btn primary pets-save">Save</button>
+        <button class="modal-close" aria-label="Close">×</button>
+      </div>
+      <h3>Pet owners</h3>
+      <div class="pets-help">
+        Assign an owner to actors that show up under their own name in the
+        log (e.g. <code>Onyx Crusher</code> for a mage water pet). Their
+        damage gets re-attributed to <code>&lt;owner&gt;\`s pet</code>.
+        The owner dropdown is filtered to actors on the same side
+        (friendly pet → friendly owners). Backtick-named pets are
+        already handled automatically — assign them only if you want
+        to override.
+        <br>
+        Pick owners from the dropdowns, then click <strong>Save</strong>
+        to commit all changes at once. <strong>Clear</strong> on a row
+        just resets that row to "(no owner)" — nothing is saved until
+        you click Save. Close (×) discards everything.
+      </div>
+      ${tableHTML}
+      ${otherHTML}
+    </div>`;
+  document.body.appendChild(modal);
+
+  const close = () => modal.remove();
+  modal.addEventListener('click', e => { if (e.target === modal) close(); });
+  modal.querySelector('.modal-close').addEventListener('click', close);
+
+  // Track Other-table rows the user has queued for clearing. They have
+  // no dropdown to inspect, so we accumulate explicit intents here and
+  // commit them as part of the batch on Save.
+  const pendingOtherClears = new Set();
+
+  // Main-table Clear: reset the dropdown to "(no owner)". Doesn't post
+  // anything — the actual write happens when the user clicks Save.
+  modal.querySelectorAll('.pets-table .owner-clear').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const tr = btn.closest('tr');
+      const select = tr.querySelector('select.owner-input');
+      if (select) select.value = '';
+    });
+  });
+
+  // Other-table Clear: queue the actor for a clear and dim the row so
+  // the user sees the change is staged but not yet saved.
+  modal.querySelectorAll('.pets-table .owner-clear-other').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const tr = btn.closest('tr');
+      const actor = tr.dataset.actor;
+      pendingOtherClears.add(actor);
+      tr.style.opacity = '0.4';
+      tr.style.textDecoration = 'line-through';
+      btn.disabled = true;
+      btn.textContent = 'Cleared';
+    });
+  });
+
+  // Save: collect all dropdown values that differ from their original,
+  // plus any queued Other-table clears, and POST as a single batch so
+  // the server invalidates the encounter cache once.
+  const saveBtn = modal.querySelector('.pets-save');
+  saveBtn.addEventListener('click', async () => {
+    const updates = [];
+    modal.querySelectorAll('tr[data-actor]').forEach(tr => {
+      const select = tr.querySelector('select.owner-input');
+      if (!select) return;  // Other-table row — handled below
+      const actor = tr.dataset.actor;
+      const cur = (select.value || '').trim();
+      const orig = ownerByActorLo[actor.toLowerCase()] || '';
+      if (cur.toLowerCase() !== orig.toLowerCase()) {
+        updates.push({actor, owner: cur || null});
+      }
+    });
+    for (const actor of pendingOtherClears) {
+      updates.push({actor, owner: null});
+    }
+    if (updates.length === 0) {
+      close();
+      return;
+    }
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving…';
+    try {
+      const r = await fetch('/api/pet-owners', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({updates}),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      close();
+      route();
+    } catch (e) {
+      alert(`Save failed: ${e.message}`);
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Save';
+    }
+  });
+}
+
 function computePairStatsHTML(hits, series, bucketSeconds, unit, selectionRange) {
   if (hits.length === 0) {
     return '<span class="sub">No data under the current filter.</span>';
@@ -2658,6 +3616,14 @@ async function uploadLog(file) {
     if (el) el.style.width = pct + '%';
   };
 
+  // Parse-status poller, started when upload bytes finish and the
+  // server transitions into parsing. Stopped when the XHR resolves.
+  let stopPoll = null;
+  const setLabel = txt => {
+    const el = document.querySelector('#app .upload-label');
+    if (el) el.innerHTML = txt;
+  };
+
   try {
     await new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
@@ -2671,13 +3637,24 @@ async function uploadLog(file) {
         setBar(pct);
         setPct(pct + '%');
       });
-      // Bytes have all been sent — server is now parsing the log and
-      // building the encounter cache. Parsing time scales with log size
-      // (~10s for a 30MB log), so showing an indeterminate state here
-      // matters more than the upload bar for big files.
+      // Bytes have all been sent — server is now parsing the log. Flip
+      // the bar to 0% and start polling /api/parse-status to drive a
+      // real progress fill instead of the previous indeterminate label.
       xhr.upload.addEventListener('load', () => {
-        setBar(100);
+        setBar(0);
         setPct('Parsing log…');
+        setLabel(`Parsing <strong>${escapeHTML(file.name)}</strong>`);
+        stopPoll = startParsePoll(s => {
+          if (s.state === 'parsing') {
+            setBar(s.pct);
+            const note = (s.total_bytes > 0)
+              ? `${fmtMB(s.bytes_read)} / ${fmtMB(s.total_bytes)} · ${s.pct.toFixed(1)}%`
+              : `${s.pct.toFixed(1)}%`;
+            setPct(note);
+          } else if (s.state === 'error') {
+            setPct('Parse error');
+          }
+        });
       });
       xhr.addEventListener('load', () => {
         if (xhr.status >= 200 && xhr.status < 300) resolve();
@@ -2688,9 +3665,11 @@ async function uploadLog(file) {
       xhr.send(file);
     });
 
+    if (stopPoll) { stopPoll(); stopPoll = null; }
     location.hash = '#/';
     route();
   } catch (e) {
+    if (stopPoll) { stopPoll(); stopPoll = null; }
     app.innerHTML = `<div class="err">Upload failed: ${escapeHTML(e.message)}</div>`;
   }
 }

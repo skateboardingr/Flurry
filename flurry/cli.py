@@ -130,6 +130,11 @@ def ui_main():
                     help='Seconds between fights to still consider them one '
                          'encounter (default 10). Use 0 for strict overlap '
                          'only; bump higher to merge phase-pause splits.')
+    ap.add_argument('--since-hours', type=int, default=8,
+                    help='Analyze only the last N hours of log activity '
+                         '(anchored to the log\'s last timestamp). 0 = whole '
+                         'log. Default 8 covers a typical raid night while '
+                         'keeping the first parse fast on multi-day logs.')
     ap.add_argument('--no-browser', action='store_true',
                     help="Don't auto-open a browser tab")
     args = ap.parse_args()
@@ -141,4 +146,5 @@ def ui_main():
           min_duration_seconds=args.min_duration,
           bucket_seconds=args.bucket,
           encounter_gap_seconds=args.encounter_gap,
+          since_hours=args.since_hours,
           open_browser=not args.no_browser)

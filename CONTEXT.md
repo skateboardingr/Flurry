@@ -58,6 +58,7 @@ flurry/
 │   ├── parser.py            # regex patterns: line text -> Event
 │   ├── tail.py              # file follower (replay + live tail modes)
 │   ├── analyzer.py          # FightResult, Timeline; pure data, no I/O
+│   ├── sidecar.py           # per-log persistence: <log>.flurry.json
 │   ├── report.py            # text + HTML rendering
 │   ├── server.py            # local web UI (stdlib http.server + inline HTML)
 │   └── cli.py               # argparse-backed entry functions
@@ -65,9 +66,11 @@ flurry/
 ├── _pyinstaller_entry.py    # tiny launcher; PyInstaller bundles this
 ├── build_exe.py             # `python build_exe.py` -> dist/flurry.exe
 └── tests/
-    ├── test_parser.py        # 13 tests: parser correctness
+    ├── test_parser.py        # 29 tests: parser correctness
     ├── test_analyzer.py      # 10 tests: analyzer correctness
-    └── test_detect_fights.py # 11 tests: fight auto-detection
+    ├── test_detect_fights.py # 11 tests: fight auto-detection
+    ├── test_overrides.py     # 12 tests: pet-owner + manual encounter
+    └── test_sidecar.py       # 17 tests: sidecar load/save + helpers
 ```
 
 ---
@@ -392,9 +395,16 @@ pattern, think about ordering.
       don't split a single engagement into two encounters. The library
       default for `group_into_encounters()` itself is still 0 (strict
       overlap); only the UI/CLI surfaces opt into the wider window.
-- [x] This is the auto-grouping path. Roadmap item 1 (manual grouping +
-      sidecar persistence) is still open for cases auto-grouping gets
-      wrong (e.g. two distinct boss kills back-to-back with no gap).
+- [x] Manual encounter override (pass 2) is wired through:
+      `analyzer.group_into_encounters(..., manual_groups=[{fight_keys, name}])`
+      pulls the listed fights into their own encounter ahead of auto-
+      grouping. The session table renders a checkbox column + an action
+      bar with Merge / Split / Clear; selections persist across sort
+      re-renders but reset on log/param changes (encounter ids shift).
+      Manually-pinned encounters get a "★ pinned" badge. Singleton or
+      stale-keyed manual groups are silently ignored (the auto-grouper
+      handles them) so a sidecar referencing fights that disappeared
+      under new params doesn't break.
 - [x] Encounter detail splits the per-attacker table into "Friendlies"
       and "Enemies" sections. Classification compares per-name dealt vs
       received damage in the encounter: pets (backtick suffix) are always
@@ -413,16 +423,101 @@ pattern, think about ordering.
       target/source name in a breakdown pops a modal Chart.js graph of
       "damage from X to Y over time" using that series.
 
+### Time-window slicing + parse progress
+- [x] `tail.read_last_timestamp(path, max_tail_bytes=4MB)` — reads only
+      the tail of a file to find the latest `[Day Mon DD HH:MM:SS YYYY]`
+      timestamp. Used to anchor `since_hours` to log-end (NOT wall
+      clock), so picking "last 4h" works on a log that ended yesterday.
+- [x] `tail.find_offset_for_timestamp(path, since)` — backwards scan in
+      64KB chunks (with 64-byte overlap to handle timestamps that
+      straddle chunk boundaries) returning the byte offset of the
+      first line at-or-after `since`. Returns 0 if `since` predates the
+      log, file size if it postdates the log. Line-aligned by
+      construction so `tail_file(start_offset=...)` doesn't need to
+      discard a fragment.
+- [x] `tail.tail_file(start_offset=, progress_cb=, progress_interval_bytes=)` —
+      added byte-offset start and a progress callback invoked every
+      ~256KB of reads with the absolute byte position. Callback errors
+      are swallowed so a flaky observer can't kill the parse.
+- [x] `analyzer.detect_combat(since=, progress_cb=)` plumbs both
+      through: `since` is resolved to a starting byte offset (with the
+      inline `ev.timestamp < since` filter as backstop), and the
+      progress callback receives `(bytes_read, slice_size)` where both
+      values are RELATIVE to the slice (so the UI bar fills 0→100%
+      across the work actually done, not jumping to 67% at start
+      because the offset was two-thirds into the file).
+- [x] Server: `_State.since_hours` param (default 0 = whole log).
+      `_ensure_combat_cached` writes to `_State.parse_progress` dict
+      with state ∈ {idle, parsing, done, error} as it walks. Reads are
+      lock-free (single-attribute access is GIL-safe), so a concurrent
+      `GET /api/parse-status` request can serve progress while another
+      request thread holds the parse. Cache invalidation on any change
+      that affects the parse (params, reload, log switch) resets
+      progress to 'idle' so the next parse starts the bar from 0.
+- [x] UI: "Last N hours" input in the params panel; live progress bar
+      during upload (post-bytes phase) and during initial render of
+      session / encounter / debug views. Polling stops as soon as the
+      relevant request resolves — we don't try to detect 'done' from
+      the status alone since the cache could be filled by a still-in-
+      flight response. `withParseProgress(promise, app, headline)` is
+      the helper; `parseProgressHTML(s, headline)` renders the bar.
+- [x] CLI: `flurry-ui --since-hours N` matches the UI knob.
+
+### Sidecar / user overrides (`flurry/sidecar.py`)
+- [x] `<logfile>.flurry.json` next to each log holds two kinds of edits:
+      pet-owner assignments (`{actor: owner}`) and manual encounter
+      groupings (`[{fight_keys: [...], name: <opt>}]`). Schema is
+      versioned (`SIDECAR_VERSION = 1`); missing/corrupt files load as
+      empty so the UI never blocks on a bad sidecar.
+- [x] Stable identifiers: pet owners are keyed by attacker name (case-
+      insensitive lookup); fights are keyed by `target.lower()|start.isoformat()`
+      (`flurry.sidecar.fight_key()` is the canonical builder, mirrored
+      in `analyzer._fight_key`). `fight_id` and `encounter_id` are
+      deliberately NOT used in the on-disk format because both shift
+      when detection params change.
+- [x] Atomic writes via tmp + `os.replace`; an interrupted save can't
+      leave a corrupted sidecar.
+- [x] `Sidecar.set_pet_owner`, `merge_encounter`, and `remove_keys_from_manual`
+      are the mutation entry points; merge_encounter dedupes (a fight
+      can only live in one manual group at a time) and prunes groups
+      below 2 keys back to auto-grouping.
+- [x] `analyzer.apply_pet_owners(fights, heals, pet_owners)` rewrites
+      attacker/healer names to `<owner>\`s pet`, re-aggregating per-
+      attacker stats so two raw actors collapsing to the same owner sum
+      cleanly. Applied at encounter-build time (NOT at the per-fight
+      cache layer) so the raw attacker names stay visible to the pet-
+      owner edit modal — the trade-off is one rewrite pass per sidecar
+      edit, vs. having to walk and revert the cached fights.
+- [x] Server endpoints: `POST /api/pet-owners` (`{actor, owner}`,
+      owner=null clears) and `POST /api/encounters` (`{action: merge|split,
+      encounter_ids: [...], name?}`). Encounter ids are resolved to
+      stable fight keys server-side under the lock, so id instability
+      across param changes isn't a wire-format concern.
+- [x] Pet-owner edit modal on the encounter detail page: opened from a
+      "Pet owners" header button, lists this encounter's RAW attackers
+      (`raw_attackers` is exposed on `/api/encounter/<id>` for exactly
+      this purpose), each with their current owner mapping plus an
+      input + Save/Clear. Owners assigned to actors NOT in the current
+      encounter are listed below as "Other assignments" so the user can
+      still see and clear them — otherwise an assignment made on one
+      encounter would be invisible from any other.
+
 ### Packaging
 - [x] `pyproject.toml`, installs cleanly with `pip install -e .`
 - [x] Zero runtime dependencies (pure stdlib)
 - [x] CLIs registered as console_scripts
 
 ### Tests
-- [x] 13 parser tests (regex correctness against real log lines)
+- [x] 29 parser tests (regex correctness against real log lines)
 - [x] 10 analyzer tests (using real Hacral log as fixture, with skip-if-missing)
 - [x] 11 detect_fights tests (synthetic log fixtures via tmpfile — no
       external dependency, run anywhere)
+- [x] 12 override tests for `apply_pet_owners` + manual_groups (no log
+      fixture needed — synthesized FightResults)
+- [x] 17 sidecar tests for the persistence layer (round-trip through
+      JSON, mutation helpers, atomic writes, corrupt-file handling)
+- [x] 13 tail-window tests for `read_last_timestamp`, byte-offset
+      slicing, progress callbacks, and `since=` filtering
 
 ---
 
@@ -560,7 +655,10 @@ Flurry ships as a **standalone app**, not as a CLI installer. The shape:
 
 - **`analyze_fight` reads the whole log** even if the fight is at the
   start. Fine for ~30-min sessions; will be slow on multi-day logs.
-  Fix when adding multi-fight support.
+  Note that `detect_combat` accepts `since=` for byte-offset slicing
+  (used by `flurry-ui --since-hours`); `analyze_fight` does not yet —
+  it would be a small change to plumb it through, similar to
+  detect_combat.
 
 - **No tests for `report.py`** — the rendering layer is untested.
   Mostly cosmetic, hard to test text formatting without making tests
@@ -577,36 +675,23 @@ Flurry ships as a **standalone app**, not as a CLI installer. The shape:
 
 These are documented in README.md too; this is the working list.
 
-1. **Web UI — pass 2: encounter grouping.** The pass-1 UI does
-   navigation only. Pass 2 adds multi-select on the session table,
-   "Group selected as encounter" with a name prompt, and persistence
-   to a `<logfile>.flurry.json` sidecar next to the log. Encounter
-   view shows merged stats. Server endpoints to add: `GET /api/encounters`,
-   `POST /api/encounters` (create), `DELETE /api/encounters/<id>`.
-
-2. **Web UI — pass 3: pet ownership.** Click an attacker name (named
-   pet or otherwise) → assign owner. Re-renders affected fights with
-   the pet's damage attributed to the owner (or shown as
-   `<owner>\`s pet`, matching backtick-pet rendering). Persists in the
-   same sidecar. Server endpoint: `POST /api/pet-owners`.
-
-3. **Multi-fight session reports** — average DPS per attacker across a
+1. **Multi-fight session reports** — average DPS per attacker across a
    raid night. Min/max/median/p95 per fight per player. Built on top
    of `detect_fights`. Has a natural home in the UI as a "session
    summary" view.
 
-4. **Healing and tanking views** — same per-attacker model but for
+2. **Healing and tanking views** — same per-attacker model but for
    HPS (heals received per target) and damage mitigated/taken. Touches
    parser (new event types), analyzer (new accumulators), and reports.
 
-5. **Log diffing** — compare same-boss fights before and after a gear
+3. **Log diffing** — compare same-boss fights before and after a gear
    change. "What did this new weapon actually do?"
 
-6. **JSON export** — `flurry-dps --json`, `flurry-timeline --json`, and
+4. **JSON export** — `flurry-dps --json`, `flurry-timeline --json`, and
    `flurry-session --json` for piping to other tools. The UI has its
    own JSON via `/api/*` already; the CLI flags would just shell out.
 
-7. **Live tail mode** — `tail.py` already supports follow-mode; the
+5. **Live tail mode** — `tail.py` already supports follow-mode; the
    analyzer and server don't. Would let you watch DPS in real time
    during a fight, and push UI updates via SSE or polling.
 
