@@ -38,6 +38,15 @@ Grab the latest `flurry.exe` from the releases page. Double-click it. A
 console window opens, the URL prints, and your browser opens to the UI.
 Close the console to stop.
 
+> **Heads-up about Windows SmartScreen.** The first time you run
+> `flurry.exe` you'll likely see *"Windows protected your PC — unrecognized
+> app from an unknown publisher"*. That's the standard warning Windows
+> shows for any unsigned binary it hasn't seen before — not a malware
+> detection. Click **More info → Run anyway**. Windows will remember
+> that exact build's hash and not prompt again on this machine; new
+> releases (different hash) will prompt once. Source is on GitHub if
+> you'd rather build it yourself — see option 3 below.
+
 ### 2. Run from source (Python installed)
 
 ```bash
