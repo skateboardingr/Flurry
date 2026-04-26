@@ -50,8 +50,8 @@ Close the console to stop.
 ### 2. Run from source (Python installed)
 
 ```bash
-git clone <your-repo>
-cd flurry
+git clone https://github.com/skateboardingr/Flurry.git
+cd Flurry
 python -m flurry              # launch UI
 ```
 
