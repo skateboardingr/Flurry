@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flurry"
+version = "0.1.0"
+description = "EverQuest combat log analyzer"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Flurry contributors" }
+]
+keywords = ["everquest", "eq", "log", "parser", "dps", "combat"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Games/Entertainment",
+]
+
+# Pure-Python; no runtime dependencies beyond the standard library.
+dependencies = []
+
+# No [project.scripts]: Flurry is a standalone app, not a CLI installer.
+# Use `python -m flurry [args]`, the flurry.bat launcher in the repo root,
+# or the bundled flurry.exe (built via build_exe.py).
+#
+# `pip install -e .` is still useful for importing the parser/analyzer
+# library from another project (e.g. the bot).
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flurry*"]
+
+# Disable pytest's cache provider on this repo. The repo lives on a
+# network drive (Z:) where pytest's cache-dir lock dance fails with
+# "WinError 59 An unexpected network error occurred", and each test
+# run leaks a `pytest-cache-files-*` directory at the repo root. The
+# cache only ever stored last-failed test ids, so disabling it has no
+# real downside here.
+[tool.pytest.ini_options]
+addopts = "-p no:cacheprovider"
