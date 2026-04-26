@@ -27,10 +27,37 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 def main():
     # Clean previous build artifacts so stale files don't sneak in.
+    # On Windows, Explorer / Defender / antivirus often hold a transient
+    # handle on the freshly-extracted exe (or the dist dir itself); a
+    # plain rmtree fails with PermissionError mid-walk. Skip the wipe
+    # if the directory is already empty (PyInstaller will overwrite
+    # files cleanly inside it). For non-empty dirs, retry briefly to
+    # let the AV scan finish.
+    import time as _time
     for d in ('build', 'dist'):
         full = os.path.join(REPO_ROOT, d)
-        if os.path.isdir(full):
-            shutil.rmtree(full)
+        if not os.path.isdir(full):
+            continue
+        # Try to wipe; if it fails because something's locked, only
+        # complain when there's actually data left behind.
+        for attempt in range(3):
+            try:
+                shutil.rmtree(full)
+                break
+            except (PermissionError, OSError):
+                _time.sleep(0.5)
+        else:
+            # Last attempt: walk and remove individual files. If the
+            # directory is empty after this, PyInstaller is happy.
+            try:
+                for root, dirs, files in os.walk(full, topdown=False):
+                    for name in files:
+                        try:
+                            os.unlink(os.path.join(root, name))
+                        except OSError:
+                            pass
+            except OSError:
+                pass
 
     cmd = [
         sys.executable, '-m', 'PyInstaller',

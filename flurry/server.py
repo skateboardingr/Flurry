@@ -20,14 +20,13 @@ import json
 import os
 import re
 import socketserver
+import statistics
 import tempfile
 import threading
 import urllib.parse
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
-
-from datetime import timedelta
 
 from .analyzer import (
     FightResult, Encounter, Heal,
@@ -331,6 +330,190 @@ def _fight_detail(f: FightResult, bucket_seconds: int = 5) -> dict:
             'datasets': datasets,
         },
         'biggest_hits': biggest_hits,
+    }
+
+
+def _session_summary_payload(encounters: List[Encounter],
+                             killed_only: bool = False,
+                             encounter_ids: Optional[set] = None) -> dict:
+    """Aggregate per-attacker stats across all encounters in the session.
+
+    Builds the data behind the multi-fight session-summary view:
+      - Header totals (start/end, duration, encounter and kill counts).
+      - Per-attacker rollup: total damage, avg/median/p95/best DPS over
+        the encounters where they appeared, biggest hit, encounter count.
+      - Per-(attacker, encounter) DPS arrays so the front-end can draw
+        the trend chart and heatmap without a second roundtrip.
+
+    `killed_only=True` filters to encounters with `fight_complete=True`
+    so wipes / partial pulls don't drag down a player's averages — most
+    useful for raid-night stats. Default False to match the session
+    table's full set; the front-end has its own toggle.
+
+    `encounter_ids`, when provided, restricts the rollup to that subset
+    (matched on `Encounter.encounter_id`). Used by the session view's
+    "Session summary (N selected)" path: the user ticks specific
+    encounters and gets a rollup scoped to just those. Applied AFTER
+    `killed_only` so explicit selection always wins — if the user
+    picked an incomplete fight, we honor that.
+
+    Friendly/enemy classification is computed at the SESSION level using
+    the same `received > dealt + healed` rule the encounter detail view
+    uses: a healer who only takes AoE damage stays friendly because
+    their healing output counts on the active side. Enemies that
+    self-heal get classified correctly because incoming raid damage
+    swamps their self-heal totals.
+    """
+    if killed_only:
+        encounters = [e for e in encounters if e.fight_complete]
+    if encounter_ids is not None:
+        encounters = [e for e in encounters if e.encounter_id in encounter_ids]
+    if not encounters:
+        return {
+            'start': None, 'end': None,
+            'duration_seconds': 0,
+            'encounter_count': 0, 'killed_count': 0,
+            'total_damage': 0, 'total_healing': 0,
+            'attackers': [],
+            'encounters': [],
+            'killed_only': killed_only,
+            'scoped': encounter_ids is not None,
+        }
+
+    # Order encounters chronologically so chart x-axis and heatmap
+    # columns read left-to-right in time.
+    encounters = sorted(encounters, key=lambda e: e.start or datetime.min)
+
+    encounter_meta = []
+    for e in encounters:
+        encounter_meta.append({
+            'encounter_id': e.encounter_id,
+            'name': _encounter_summary(e)['name'],
+            'duration_seconds': round(e.duration_seconds, 1),
+            'fight_complete': e.fight_complete,
+            'start': e.start.strftime('%Y-%m-%d %H:%M:%S') if e.start else None,
+        })
+
+    # Per-attacker accumulators. Keyed by lowercased name; canonical
+    # casing is captured from the first occurrence so the table reads
+    # naturally even if EQ used inconsistent casing across encounters.
+    by_attacker: dict = {}
+
+    for e in encounters:
+        merged = merge_encounter(e)
+        duration = merged.duration_seconds or 1.0
+
+        # Damage taken in this encounter, keyed by lowercased target.
+        # Targets aren't rewritten so this works for raw + rewritten
+        # alike — same shape as the encounter detail classifier.
+        received_in_enc: dict = {}
+        for m in e.members:
+            received_in_enc[m.target.lower()] = (
+                received_in_enc.get(m.target.lower(), 0) + m.total_damage)
+        # Healing dispensed in this encounter, keyed by healer.
+        heal_in_enc: dict = {}
+        for h in e.heals:
+            heal_in_enc[h.healer.lower()] = (
+                heal_in_enc.get(h.healer.lower(), 0) + h.amount)
+
+        seen_attackers = set()
+        for atk_name, s in merged.stats_by_attacker.items():
+            key = atk_name.lower()
+            seen_attackers.add(key)
+            by = by_attacker.setdefault(key, {
+                'attacker': atk_name, 'damage': 0, 'received': 0,
+                'healed': 0, 'biggest': 0,
+                'per_encounter_dps': {},
+                'per_encounter_damage': {},
+            })
+            by['damage'] += s.damage
+            by['biggest'] = max(by['biggest'], s.biggest)
+            by['per_encounter_dps'][e.encounter_id] = round(s.damage / duration)
+            by['per_encounter_damage'][e.encounter_id] = s.damage
+
+        # Layer in received / healed for everyone, including actors who
+        # only got hit or only healed. They might not have an attacker
+        # row yet — bring them in so the classifier sees the full
+        # picture (a pure healer who never landed a hit still needs to
+        # be classified for completeness, even if filtered out below).
+        for tgt_lo, dmg in received_in_enc.items():
+            by = by_attacker.setdefault(tgt_lo, {
+                'attacker': tgt_lo, 'damage': 0, 'received': 0,
+                'healed': 0, 'biggest': 0,
+                'per_encounter_dps': {}, 'per_encounter_damage': {},
+            })
+            by['received'] += dmg
+        for healer_lo, amt in heal_in_enc.items():
+            by = by_attacker.setdefault(healer_lo, {
+                'attacker': healer_lo, 'damage': 0, 'received': 0,
+                'healed': 0, 'biggest': 0,
+                'per_encounter_dps': {}, 'per_encounter_damage': {},
+            })
+            by['healed'] += amt
+
+    encounter_ids = [m['encounter_id'] for m in encounter_meta]
+
+    # Build the per-attacker output rows, computing summary stats over
+    # the encounters where the attacker actually appeared (non-zero
+    # damage). Empty rows (someone who only took damage) drop out of
+    # the rollup; they have nothing to display.
+    attackers_out = []
+    for key, by in by_attacker.items():
+        dps_values = [v for v in by['per_encounter_dps'].values() if v > 0]
+        if not dps_values:
+            continue
+        # Side classification: same rule as _encounter_payload uses
+        # per-encounter, applied at the session level. Pets always
+        # friendly via the backtick suffix.
+        if by['attacker'].endswith('`s pet'):
+            side = 'friendly'
+        else:
+            side = ('enemy' if by['received'] > by['damage'] + by['healed']
+                    else 'friendly')
+
+        avg_dps = round(sum(dps_values) / len(dps_values))
+        median_dps = round(statistics.median(dps_values))
+        # P95: top-5% encounter. For small N (which is most logs), the
+        # p95 collapses toward the best, so we just use max for N<20.
+        if len(dps_values) >= 20:
+            p95_dps = sorted(dps_values, reverse=True)[int(len(dps_values) * 0.05)]
+        else:
+            p95_dps = max(dps_values)
+        best_dps = max(dps_values)
+
+        attackers_out.append({
+            'attacker': by['attacker'],
+            'side': side,
+            'total_damage': by['damage'],
+            'avg_dps': avg_dps,
+            'median_dps': median_dps,
+            'p95_dps': p95_dps,
+            'best_dps': best_dps,
+            'biggest': by['biggest'],
+            'encounters_present': len(dps_values),
+            # Aligned to encounter_ids order; 0 means "didn't show up".
+            # The heatmap uses this directly to color cells.
+            'per_encounter_dps': [by['per_encounter_dps'].get(eid, 0)
+                                  for eid in encounter_ids],
+            'per_encounter_damage': [by['per_encounter_damage'].get(eid, 0)
+                                     for eid in encounter_ids],
+        })
+    attackers_out.sort(key=lambda x: x['total_damage'], reverse=True)
+
+    starts = [e.start for e in encounters if e.start]
+    ends = [e.end for e in encounters if e.end]
+    return {
+        'start': min(starts).strftime('%Y-%m-%d %H:%M:%S') if starts else None,
+        'end': max(ends).strftime('%Y-%m-%d %H:%M:%S') if ends else None,
+        'duration_seconds': sum(e.duration_seconds for e in encounters),
+        'encounter_count': len(encounters),
+        'killed_count': sum(1 for e in encounters if e.fight_complete),
+        'total_damage': sum(e.total_damage for e in encounters),
+        'total_healing': sum(e.total_healing for e in encounters),
+        'attackers': attackers_out,
+        'encounters': encounter_meta,
+        'killed_only': killed_only,
+        'scoped': encounter_ids is not None,
     }
 
 
@@ -652,6 +835,29 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                     self.send_error(404, f'no fight with id {fid_str}')
                     return
                 self._serve_json(payload)
+            elif path == '/api/session-summary':
+                # Multi-fight rollup. Query params:
+                #   ?killed_only=1 — restrict to fight_complete=True
+                #     encounters (raid wipes / aborted pulls don't drag
+                #     down the avg/median DPS for that night).
+                #   ?encounter_ids=1,2,3 — scope the rollup to a
+                #     user-selected subset (driven by the session
+                #     table's checkboxes). Empty / absent → whole log.
+                killed_only = qs.get('killed_only', ['0'])[0] in ('1', 'true', 'True')
+                ids_raw = qs.get('encounter_ids', [''])[0]
+                encounter_ids = None
+                if ids_raw:
+                    try:
+                        encounter_ids = {int(s) for s in ids_raw.split(',') if s.strip()}
+                    except ValueError:
+                        self.send_error(400, 'encounter_ids must be a comma-separated list of integers')
+                        return
+                    if not encounter_ids:
+                        encounter_ids = None
+                encounters = _get_encounters()
+                self._serve_json(_session_summary_payload(
+                    encounters, killed_only=killed_only,
+                    encounter_ids=encounter_ids))
             elif path == '/api/parse-status':
                 # Lock-free read of the progress dict — single attribute
                 # access, GIL-safe. Polled rapidly by the upload UI to
@@ -1319,6 +1525,14 @@ _INDEX_HTML = r'''<!DOCTYPE html>
   tr.pair-row { cursor: pointer; }
   tr.pair-row:hover td { background: var(--row-hover); }
   tr.pair-row td:first-child { color: var(--accent); }
+  /* Synthetic "All" row at the top of each breakdown table — sums the
+     other rows. Subtle accent stripe so it reads as a rollup, not just
+     another target. */
+  tr.pair-row-all td { background: rgba(96, 165, 250, 0.08);
+                       border-top: 1px solid var(--border);
+                       border-bottom: 1px solid var(--border); }
+  tr.pair-row-all:hover td { background: rgba(96, 165, 250, 0.16); }
+  tr.pair-row-all td:first-child { color: var(--text-bright); }
 
   /* Pair-detail modal */
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.65);
@@ -1474,6 +1688,79 @@ _INDEX_HTML = r'''<!DOCTYPE html>
                                   padding: 4px 10px; margin-left: 4px; }
   .pets-current-list { margin-top: 16px; font-size: 0.85rem; }
   .pets-current-list .sub { color: var(--text-dim); }
+
+  /* Session-summary view: charts stacked on the left, rollup table on
+     the right. Stack everything into a single column on narrow screens
+     so the heatmap stays usable. `align-items: start` so each column
+     sizes to its own content — without it, the grid stretches both
+     columns to the row height (set by whichever side is taller),
+     leaving the panel BG ending mid-table on the shorter side. */
+  .ss-grid { display: grid;
+             grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+             gap: 16px; margin-bottom: 20px; align-items: start; }
+  .ss-charts { display: flex; flex-direction: column; gap: 16px;
+               min-width: 0; }
+  .ss-table-col { display: flex; flex-direction: column; gap: 16px;
+                  min-width: 0; }
+  @media (max-width: 1100px) { .ss-grid { grid-template-columns: 1fr; } }
+  .ss-section-h { color: var(--text-bright); font-size: 1rem;
+                  margin: 0 0 12px; font-weight: 600; }
+  .ss-section-h .sub { color: var(--text-dim); font-weight: 400;
+                       font-size: 0.85rem; margin-left: 6px; }
+
+  /* Rollup table — narrower text, fewer fences so it fits in the right
+     column without wrapping the numeric columns. The 8-column table
+     can have a min-content width wider than the right grid column on
+     narrow viewports / with long attacker names; the wrapper provides
+     horizontal scroll instead of bleeding past the panel BG. */
+  .ss-table-wrap { overflow-x: auto; }
+  table.ss-table { width: 100%; border-collapse: separate;
+                   border-spacing: 0; font-size: 0.85rem; }
+  table.ss-table th, table.ss-table td { padding: 6px 8px;
+                                          border-bottom: 1px solid var(--border); }
+  table.ss-table th { color: var(--text-dim); font-weight: 600;
+                      font-size: 0.72rem; text-transform: uppercase;
+                      letter-spacing: 0.04em; text-align: left; }
+  table.ss-table td.num, table.ss-table th.num { text-align: right;
+                                                  font-variant-numeric: tabular-nums; }
+  table.ss-table td.target { color: var(--text-bright); font-weight: 600; }
+  /* Lock the Attacker column when the wrapper scrolls horizontally so
+     the player name stays in view as the user reads across to the
+     stats columns. Background matches the panel so scrolled content
+     passes behind cleanly; the right-edge shadow distinguishes the
+     pinned column from the rest. border-collapse must be `separate`
+     for sticky borders to render properly — collapsed borders detach
+     from sticky cells and ghost in place during scroll. */
+  table.ss-table th:first-child,
+  table.ss-table td:first-child { position: sticky; left: 0;
+                                  background: var(--panel); z-index: 1;
+                                  box-shadow: 1px 0 0 var(--border); }
+
+  /* Heatmap — cells color-shaded by DPS magnitude. Sticky row/column
+     headers so a wide grid stays navigable. Horizontal scroll wrapper
+     keeps the rest of the layout from blowing up on raids with lots of
+     encounters. */
+  .ss-heatmap-wrap { overflow-x: auto; max-height: 60vh; }
+  table.ss-heatmap { border-collapse: collapse; font-size: 0.75rem;
+                     font-variant-numeric: tabular-nums; }
+  table.ss-heatmap th, table.ss-heatmap td { padding: 4px 6px;
+                                              border: 1px solid var(--border);
+                                              text-align: center;
+                                              white-space: nowrap; }
+  th.ss-heatmap-col-h { color: var(--text-dim); font-size: 0.7rem;
+                        background: var(--panel); position: sticky;
+                        top: 0; z-index: 1; }
+  th.ss-heatmap-row-h { color: var(--text-bright); font-size: 0.75rem;
+                        text-align: left; padding-right: 10px;
+                        background: var(--panel); position: sticky;
+                        left: 0; z-index: 1; max-width: 160px;
+                        overflow: hidden; text-overflow: ellipsis; }
+  td.ss-heatmap-cell { color: #0f1419; font-weight: 600; cursor: pointer; }
+  td.ss-heatmap-cell:hover { outline: 2px solid var(--accent);
+                             outline-offset: -2px; }
+  td.ss-heatmap-empty { color: var(--border); cursor: pointer;
+                        background: transparent; }
+  td.ss-heatmap-empty:hover { background: var(--row-hover); }
 
   /* Damage/Healing tabs above encounter detail content */
   .tabs { display: flex; gap: 4px; margin: 8px 0 16px;
@@ -2005,6 +2292,29 @@ async function renderSession() {
   setHeader(data.logfile_basename,
             `${sinceLabel} · min between fights ${data.params.gap_seconds}s · min between encounters ${data.params.encounter_gap_seconds}s · min damage ${NUM(data.params.min_damage)}`,
             true);
+  // Add a "Session summary" button to the session-view header. setHeader
+  // already laid out Refresh + Change log; we append after them so the
+  // primary nav stays leftmost. The button's label and target hash
+  // adapt to the current selection — refreshSummaryBtn (defined below)
+  // is called from refreshActionBar() whenever sessionSelected changes
+  // so the user always sees what scope they're about to load.
+  const sessActions = document.getElementById('actions');
+  if (sessActions) {
+    const summaryBtn = document.createElement('button');
+    summaryBtn.className = 'btn';
+    summaryBtn.id = 'summary-btn';
+    summaryBtn.addEventListener('click', () => {
+      // Re-read sessionSelected at click time so we always honor the
+      // latest selection, even if refreshSummaryBtn somehow lagged.
+      if (sessionSelected.size > 0) {
+        const ids = Array.from(sessionSelected).join(',');
+        location.hash = `#/session-summary?ids=${ids}`;
+      } else {
+        location.hash = '#/session-summary';
+      }
+    });
+    sessActions.appendChild(summaryBtn);
+  }
 
   const s = data.summary;
   const summaryHTML = `
@@ -2115,6 +2425,26 @@ async function renderSession() {
     const slot = document.getElementById('action-bar-slot');
     if (slot) slot.innerHTML = renderActionBar();
     wireActionBar();
+    refreshSummaryBtn();
+  }
+
+  // Sync the header's Session summary button label/title to the
+  // current selection. With nothing checked: "Session summary" + whole
+  // log. With N checked: "Session summary (N selected)" + scoped to
+  // those — same button, different scope.
+  function refreshSummaryBtn() {
+    const btn = document.getElementById('summary-btn');
+    if (!btn) return;
+    const n = sessionSelected.size;
+    if (n > 0) {
+      btn.textContent = `Session summary (${n} selected)`;
+      btn.title = `Per-attacker rollup scoped to the ${n} selected encounter${n === 1 ? '' : 's'}. Clear selection to summarize the whole log.`;
+      btn.classList.add('primary');
+    } else {
+      btn.textContent = 'Session summary';
+      btn.title = 'Per-attacker rollup across every encounter — total/avg/median/p95 DPS, plus a trend chart and attacker × encounter heatmap. Tick rows to scope to a subset.';
+      btn.classList.remove('primary');
+    }
   }
 
   function renderTablePanel() {
@@ -2260,6 +2590,7 @@ async function renderSession() {
   wireParamsPanel();
   wireTablePanel();
   wireActionBar();
+  refreshSummaryBtn();
 }
 
 async function postEncounterAction(action) {
@@ -2547,6 +2878,51 @@ async function renderEncounter(id) {
     if (!rows || rows.length === 0) {
       return `<div><h4>${heading}</h4><div class="empty">— none —</div></div>`;
     }
+    // Synthesize an "All" row that sums every breakdown row, so the
+    // user can pop a chart of the attacker's total dealt-to-everyone or
+    // total taken-from-everyone in this encounter without picking a
+    // single target/source. Series is element-wise summed across rows
+    // (different lengths shouldn't happen — every row is bucketed off
+    // the same encounter timeline — but be defensive). hits_detail is
+    // concatenated; the modal's by-source grouping already handles a
+    // mixed pile of hits from many pairs.
+    let allDamage = 0, allHits = 0;
+    let allSeries = null;
+    const allHitsDetail = [];
+    for (const r of rows) {
+      allDamage += r.damage || 0;
+      allHits += r.hits || 0;
+      if (Array.isArray(r.series)) {
+        if (allSeries === null) {
+          allSeries = r.series.slice();
+        } else {
+          const len = Math.max(allSeries.length, r.series.length);
+          for (let i = 0; i < len; i++) {
+            allSeries[i] = (allSeries[i] || 0) + (r.series[i] || 0);
+          }
+        }
+      }
+      if (Array.isArray(r.hits_detail)) {
+        for (const h of r.hits_detail) allHitsDetail.push(h);
+      }
+    }
+    const allRow = {
+      [leftCol]: 'All',
+      damage: allDamage,
+      hits: allHits,
+      series: allSeries || [],
+      hits_detail: allHitsDetail,
+    };
+    const allAtk = leftCol === 'target' ? attackerName : 'All';
+    const allTgt = leftCol === 'target' ? 'All' : attackerName;
+    const allPairId = registerPair(allAtk, allTgt, allRow, kind);
+    const allRowHTML = `
+        <tr class="pair-row pair-row-all" data-pair-id="${allPairId}">
+          <td><strong>All</strong></td>
+          <td class="num"><strong>${NUM(allDamage)}</strong></td>
+          <td class="num"><strong>${allHits}</strong></td>
+        </tr>`;
+
     const body = rows.map(r => {
       const atk = leftCol === 'target' ? attackerName : r.attacker;
       const tgt = leftCol === 'target' ? r.target : attackerName;
@@ -2569,7 +2945,7 @@ async function renderEncounter(id) {
             <th class="num">${kind.pairAmountLabel}</th>
             <th class="num">${kind.pairCountLabel}</th>
           </tr></thead>
-          <tbody>${body}</tbody>
+          <tbody>${allRowHTML}${body}</tbody>
         </table>
       </div>`;
   };
@@ -2772,6 +3148,314 @@ async function renderEncounter(id) {
 
   // Build the visible damage chart immediately.
   buildStackedChart('dmg-chart', f.timeline, 'DPS');
+}
+
+// --- Session summary view -------------------------------------------
+//
+// Multi-fight rollup. Three pieces of UI in a single layout:
+//   - Trend chart (top-left): line chart, top-N attackers, x = encounter,
+//     y = DPS in that encounter. Reveals consistency vs spike-y players.
+//   - Heatmap (bottom-left): attacker × encounter grid, cell color
+//     intensity = DPS magnitude. Reveals "who showed up for what."
+//   - Rollup table (right column): one row per attacker with total
+//     damage, avg/median/p95/best DPS, encounters present. The
+//     authoritative numerical view; the charts are visual aids.
+//
+// State (sessionSummarySettings) is module-scope so toggling killed-only
+// or the min-DPS filter doesn't lose state on navigation back.
+
+let sessionSummarySettings = {
+  killedOnly: true,   // raid wipes drag down averages — default-filter them
+  minDps: 0,          // hide rows below this avg DPS (the table tails get
+                      // long otherwise)
+  trendTopN: 10,      // chart legend cap; rest collapse into "Other"
+};
+let sessionSummaryChart = null;
+
+async function renderSessionSummary(scopedIds) {
+  if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+  if (sessionSummaryChart) { sessionSummaryChart.destroy(); sessionSummaryChart = null; }
+  const app = document.getElementById('app');
+
+  // When scoped to a user-selected subset, force killed_only OFF so
+  // the explicit selection is honored as-is. Wipes the user picked on
+  // purpose (e.g. to compare burn-phase DPS) shouldn't be filtered.
+  const scoped = Array.isArray(scopedIds) && scopedIds.length > 0;
+  const killedOnlyForRequest = scoped ? false : sessionSummarySettings.killedOnly;
+
+  let data;
+  try {
+    let url = '/api/session-summary?killed_only=' +
+              (killedOnlyForRequest ? '1' : '0');
+    if (scoped) url += '&encounter_ids=' + scopedIds.join(',');
+    data = await withParseProgress(
+      () => fetchJSON(url), app, 'Parsing log…');
+  } catch (e) {
+    app.innerHTML = `<div class="err">Failed to load session summary: ${e.message}</div>`;
+    return;
+  }
+
+  const scopeLabel = scoped ? ` · scoped to ${scopedIds.length} selected` : '';
+  setHeader('Session summary',
+            `${data.encounter_count} encounters · ${data.killed_count} killed · ` +
+            `${NUM(data.total_damage)} damage · ${FMT_DUR(data.duration_seconds)} of combat` +
+            scopeLabel,
+            true);
+
+  const friendlies = data.attackers.filter(a => a.side === 'friendly')
+                                    .filter(a => a.avg_dps >= sessionSummarySettings.minDps);
+  const enemies = data.attackers.filter(a => a.side === 'enemy');
+
+  if (data.encounter_count === 0) {
+    let hint;
+    if (scoped) {
+      hint = `The selected encounter${scopedIds.length === 1 ? '' : 's'} ` +
+             `couldn't be matched — likely the detection params changed and ` +
+             `the ids shifted. <a href="#/session-summary">Show whole log</a>.`;
+    } else if (sessionSummarySettings.killedOnly) {
+      hint = 'Try un-checking "Killed only" — there may be incomplete fights worth seeing.';
+    } else {
+      hint = 'Pick a log with combat data first.';
+    }
+    app.innerHTML = `<a href="#/" class="back">← back</a>` +
+      `<div class="panel sub">No encounters in scope. ${hint}</div>`;
+    return;
+  }
+
+  app.innerHTML = `
+    <a href="#/" class="back">← back</a>
+    <div class="panel">
+      <div class="summary-grid">
+        <div class="stat"><div class="label">Encounters</div>
+          <div class="value">${data.encounter_count}</div></div>
+        <div class="stat"><div class="label">Killed</div>
+          <div class="value">${data.killed_count}</div></div>
+        <div class="stat"><div class="label">Total damage</div>
+          <div class="value">${NUM(data.total_damage)}</div></div>
+        <div class="stat"><div class="label">Combat time</div>
+          <div class="value">${FMT_DUR(data.duration_seconds)}</div></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="params-row">
+        <label class="check"
+               title="${scoped ? 'Disabled while scoped to a selection — explicit picks always show as-is.' : 'Restrict the rollup to encounters that were killed (fight_complete=true). Wipes and aborted pulls would otherwise drag down averages.'}">
+          <input type="checkbox" id="ss-killed-only"
+                 ${killedOnlyForRequest ? 'checked' : ''}
+                 ${scoped ? 'disabled' : ''}>
+          Killed encounters only
+        </label>
+        <label>Min avg DPS
+          <input type="number" id="ss-min-dps" min="0" step="100"
+                 value="${sessionSummarySettings.minDps}"
+                 title="Hide rollup rows whose avg DPS is below this. Useful for hiding low-impact actors that pad the table.">
+        </label>
+        <span class="sub" style="align-self:center; font-size:0.85rem;">
+          Showing <strong>${friendlies.length}</strong> friendly attackers
+          ${enemies.length > 0 ? `· ${enemies.length} enemies tracked separately` : ''}
+        </span>
+        ${scoped ? `<a href="#/session-summary" class="btn"
+                       style="margin-left:auto; align-self:center; text-decoration:none;"
+                       title="Drop the selection scope and show the whole-log rollup.">Show whole log</a>` : ''}
+      </div>
+    </div>
+    <div class="ss-grid">
+      <div class="ss-charts">
+        <div class="panel">
+          <h3 class="ss-section-h">DPS by encounter <span class="sub">— top ${Math.min(sessionSummarySettings.trendTopN, friendlies.length)}</span></h3>
+          <div class="chart-wrap" style="background: transparent; padding: 0; margin: 0;">
+            <canvas id="ss-trend-chart" height="200"></canvas>
+          </div>
+        </div>
+        <div class="panel">
+          <h3 class="ss-section-h">Attacker × encounter heatmap
+            <span class="sub">— click a cell to drill in</span></h3>
+          ${ssHeatmapHTML(friendlies, data.encounters)}
+        </div>
+      </div>
+      <div class="ss-table-col">
+        <div class="panel">
+          <h3 class="ss-section-h">Per-attacker rollup</h3>
+          ${ssTableHTML(friendlies)}
+        </div>
+      </div>
+    </div>`;
+
+  // Wire toggles. Both re-fetch / re-render so the data stays
+  // consistent — killedOnly hits the server, minDps is client-side.
+  // Pass scopedIds through so toggling a filter doesn't drop the
+  // selection-scope. (When scoped, killedOnly is disabled in the UI
+  // anyway, but the min-DPS input still re-renders.)
+  document.getElementById('ss-killed-only').addEventListener('change', e => {
+    sessionSummarySettings.killedOnly = e.target.checked;
+    renderSessionSummary(scopedIds);
+  });
+  document.getElementById('ss-min-dps').addEventListener('change', e => {
+    const v = parseInt(e.target.value, 10);
+    sessionSummarySettings.minDps = (Number.isNaN(v) || v < 0) ? 0 : v;
+    renderSessionSummary(scopedIds);
+  });
+
+  // Wire heatmap cell clicks. data-encounter-id navigates to that
+  // encounter's detail view — same pattern as the session table.
+  document.querySelectorAll('.ss-heatmap td[data-encounter-id]').forEach(td => {
+    td.addEventListener('click', () => {
+      location.hash = `#/encounter/${td.dataset.encounterId}`;
+    });
+  });
+
+  // Build the trend chart. Top-N attackers get their own line; the
+  // rest are summed into an "Other" line so the legend stays readable.
+  const topN = sessionSummarySettings.trendTopN;
+  const top = friendlies.slice(0, topN);
+  const rest = friendlies.slice(topN);
+  const labels = data.encounters.map(m => `#${m.encounter_id}`);
+  const datasets = top.map((a, i) => ({
+    label: a.attacker,
+    data: a.per_encounter_dps,
+    backgroundColor: COLORS[i % COLORS.length] + '33',
+    borderColor: COLORS[i % COLORS.length],
+    borderWidth: 1.5, fill: false, pointRadius: 2, tension: 0.2,
+    spanGaps: false,
+  }));
+  if (rest.length > 0) {
+    const otherSeries = data.encounters.map((_, idx) =>
+      rest.reduce((s, a) => s + (a.per_encounter_dps[idx] || 0), 0));
+    datasets.push({
+      label: `Other (${rest.length})`, data: otherSeries,
+      backgroundColor: COLORS[8] + '33', borderColor: COLORS[8],
+      borderWidth: 1, fill: false, pointRadius: 2, tension: 0.2,
+      borderDash: [4, 4], spanGaps: false,
+    });
+  }
+
+  const trendCanvas = document.getElementById('ss-trend-chart');
+  if (trendCanvas) {
+    sessionSummaryChart = new Chart(trendCanvas, {
+      type: 'line',
+      data: { labels, datasets },
+      options: {
+        responsive: true,
+        interaction: { mode: 'index', intersect: false },
+        scales: {
+          x: { ticks: { color: '#94a3b8' }, grid: { color: '#2a3142' } },
+          y: { beginAtZero: true,
+               ticks: { color: '#94a3b8',
+                        callback: v => SHORT(v) + ' DPS' },
+               grid: { color: '#2a3142' } },
+        },
+        plugins: {
+          legend: { labels: { color: '#e5e7eb', boxWidth: 12 } },
+          tooltip: {
+            callbacks: {
+              title: items => {
+                const idx = items[0].dataIndex;
+                const enc = data.encounters[idx];
+                const status = enc.fight_complete ? 'killed' : 'incomplete';
+                return `#${enc.encounter_id}: ${enc.name} (${status})`;
+              },
+              label: ctx => `${ctx.dataset.label}: ${SHORT(ctx.parsed.y)} DPS`,
+            },
+          },
+        },
+      },
+    });
+  }
+}
+
+function ssTableHTML(rows) {
+  if (rows.length === 0) {
+    return '<div class="sub">Nothing to show — try lowering the Min avg DPS filter.</div>';
+  }
+  // Wrap in an overflow-x scroller — the 8-column table has a
+  // min-content width that exceeds the right grid column on narrower
+  // viewports / longer attacker names. Without the wrapper the table
+  // bleeds past the panel BG.
+  return `
+    <div class="ss-table-wrap">
+    <table class="ss-table">
+      <thead><tr>
+        <th>Attacker</th>
+        <th class="num">Total</th>
+        <th class="num">% raid</th>
+        <th class="num">Avg DPS</th>
+        <th class="num">Median</th>
+        <th class="num">P95</th>
+        <th class="num">Best</th>
+        <th class="num" title="Encounters where this attacker dealt nonzero damage">Pres.</th>
+      </tr></thead>
+      <tbody>${rows.map(a => {
+        const totalAll = rows.reduce((s, r) => s + r.total_damage, 0) || 1;
+        const pct = (a.total_damage / totalAll * 100).toFixed(1);
+        return `
+          <tr>
+            <td class="target">${escapeHTML(a.attacker)}</td>
+            <td class="num">${NUM(a.total_damage)}</td>
+            <td class="num">${pct}%</td>
+            <td class="num">${NUM(a.avg_dps)}</td>
+            <td class="num">${NUM(a.median_dps)}</td>
+            <td class="num">${NUM(a.p95_dps)}</td>
+            <td class="num">${NUM(a.best_dps)}</td>
+            <td class="num">${a.encounters_present}</td>
+          </tr>`;
+      }).join('')}</tbody>
+    </table>
+    </div>`;
+}
+
+function ssHeatmapHTML(rows, encounters) {
+  if (rows.length === 0 || encounters.length === 0) {
+    return '<div class="sub">No data.</div>';
+  }
+  // Color intensity scales with DPS / max DPS observed in the matrix.
+  // Not log-scaled — most encounters cluster within an order of
+  // magnitude of each other; if that turns out to be wrong on real
+  // raid data we can switch to log. Cells with zero damage render
+  // empty (no fill) so absences are visually distinct from low-DPS
+  // encounters where the player did show up.
+  let maxDps = 0;
+  for (const a of rows) {
+    for (const v of a.per_encounter_dps) {
+      if (v > maxDps) maxDps = v;
+    }
+  }
+  if (maxDps === 0) maxDps = 1;
+
+  const headerCells = encounters.map(m => {
+    const status = m.fight_complete ? 'killed' : 'incomplete';
+    const tip = `#${m.encounter_id}: ${m.name} — ${status}`;
+    return `<th class="ss-heatmap-col-h" title="${escapeHTML(tip)}">${m.encounter_id}</th>`;
+  }).join('');
+
+  const bodyRows = rows.map(a => {
+    const cells = a.per_encounter_dps.map((dps, idx) => {
+      const enc = encounters[idx];
+      if (dps === 0) {
+        return `<td class="ss-heatmap-empty"
+                    data-encounter-id="${enc.encounter_id}"
+                    title="${escapeHTML(a.attacker)} — absent from #${enc.encounter_id}: ${escapeHTML(enc.name)}">·</td>`;
+      }
+      // Intensity in [0.15, 1.0] so even small values get a visible
+      // fill; pure 0..1 makes 5%-of-max cells nearly invisible.
+      const alpha = 0.15 + 0.85 * (dps / maxDps);
+      return `<td class="ss-heatmap-cell"
+                  style="background: rgba(96, 165, 250, ${alpha.toFixed(3)})"
+                  data-encounter-id="${enc.encounter_id}"
+                  title="${escapeHTML(a.attacker)} — ${SHORT(dps)} DPS in #${enc.encounter_id}: ${escapeHTML(enc.name)}">${SHORT(dps)}</td>`;
+    }).join('');
+    return `<tr>
+      <th class="ss-heatmap-row-h" title="${escapeHTML(a.attacker)}">${escapeHTML(a.attacker)}</th>
+      ${cells}
+    </tr>`;
+  }).join('');
+
+  return `
+    <div class="ss-heatmap-wrap">
+      <table class="ss-heatmap">
+        <thead><tr><th></th>${headerCells}</tr></thead>
+        <tbody>${bodyRows}</tbody>
+      </table>
+    </div>`;
 }
 
 function buildStackedChart(canvasId, timeline, unit) {
@@ -3530,6 +4214,19 @@ function route() {
     renderPicker(null);
   } else if (hash.startsWith('#/debug')) {
     renderDebug();
+  } else if (hash.startsWith('#/session-summary')) {
+    // Optional `?ids=1,2,3` scopes the summary to that subset of
+    // encounters (driven by the session-table checkboxes). Whole-log
+    // mode when absent.
+    const idsMatch = hash.match(/[?&]ids=([0-9,]+)/);
+    let ids = null;
+    if (idsMatch) {
+      ids = idsMatch[1].split(',')
+        .map(s => parseInt(s, 10))
+        .filter(n => Number.isFinite(n));
+      if (ids.length === 0) ids = null;
+    }
+    renderSessionSummary(ids);
   } else {
     renderSession();
   }

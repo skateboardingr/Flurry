@@ -422,6 +422,16 @@ pattern, think about ordering.
       bucketed `series` aligned to the encounter timeline. Clicking a
       target/source name in a breakdown pops a modal Chart.js graph of
       "damage from X to Y over time" using that series.
+- [x] Synthesized **All** row at the top of every breakdown table
+      (damage dealt-to / taken-from, healing dealt-to / taken-from).
+      Client-side aggregation in `breakdownTable`: sums `damage` and
+      `hits`, element-wise sums `series`, concatenates `hits_detail`.
+      Registers as a normal pair via `registerPair` so clicking it
+      opens the same modal — chart shows the attacker's whole
+      dealt-to-everyone (or taken-from-everyone) line, and the modal's
+      by-source grouping naturally mixes hits from all targets. Styled
+      with a subtle blue stripe (`tr.pair-row-all`) so it reads as a
+      rollup, not just another row.
 
 ### Time-window slicing + parse progress
 - [x] `tail.read_last_timestamp(path, max_tail_bytes=4MB)` — reads only
@@ -462,6 +472,56 @@ pattern, think about ordering.
       flight response. `withParseProgress(promise, app, headline)` is
       the helper; `parseProgressHTML(s, headline)` renders the bar.
 - [x] CLI: `flurry-ui --since-hours N` matches the UI knob.
+
+### Multi-fight session summary
+- [x] `_session_summary_payload(encounters, killed_only=)` aggregates
+      per-attacker stats across the session (total, avg/median/p95/best
+      DPS, biggest hit, encounters present) plus a per-(attacker,
+      encounter) DPS array for the heatmap and trend chart. Side
+      classification is computed at the session level using the same
+      `received > dealt + healed` rule the encounter detail uses, so a
+      pure healer with stray AoE damage still rolls up friendly.
+- [x] Endpoint: `GET /api/session-summary?killed_only=1` (default 0).
+      `killed_only=1` strips wipes / aborted pulls so they don't drag
+      down averages — useful default for raid-night stats; the UI
+      defaults this on.
+- [x] Route `#/session-summary`, opened from a "Session summary"
+      button in the session-view header. Layout: charts stacked on the
+      left (top: Chart.js DPS-by-encounter line chart with top-N + an
+      "Other" rollup; bottom: HTML-table heatmap with sticky row/col
+      headers, attacker × encounter, cell color intensity scaled to
+      max DPS observed in the matrix). Right column: per-attacker
+      rollup table. Stacks vertically below 1100px.
+- [x] Heatmap empty cells (player absent from an encounter) render as
+      a faint `·` placeholder with no fill, distinct from "showed up
+      but did low damage." Click any cell → encounter detail.
+- [x] Filter bar: "Killed encounters only" toggle (server-side via
+      query param) and "Min avg DPS" (client-side row filter on the
+      table; chart and heatmap show all friendlies regardless).
+      Healers without damage drop out of the rollup naturally — the
+      view is per-attacker by definition.
+- [x] Selection-scoped summary: tick rows on the session table, then
+      the **Session summary** button (label flips to "Session summary
+      (N selected)") navigates to `#/session-summary?ids=...` which
+      hits `/api/session-summary?encounter_ids=72,71,...`. When scoped,
+      `killed_only` is forced off and disabled in the UI — explicit
+      selection wins over the default "skip wipes" filter. A "Show
+      whole log" link appears in the scoped view to drop the scope.
+      Stale ids (param changes shifted the encounter ids) → empty-state
+      message points the user back to the whole-log view rather than
+      faking partial results.
+- [x] Per-attacker rollup table: sticky **Attacker** column when the
+      table scrolls horizontally (`position: sticky; left: 0` on the
+      first cell, requires `border-collapse: separate` so borders move
+      with the cell instead of ghosting). Wrapped in `.ss-table-wrap`
+      with `overflow-x: auto` so the 8-column min-content width can
+      exceed the right grid track without bleeding past the panel BG.
+      Right grid track widened from `1fr` to `1.2fr` (vs charts'
+      `1.6fr → 1.2fr`) so the rollup gets ~45% width by default.
+- [x] `.ss-grid` uses `align-items: start` so each column sizes to its
+      own content. Without it, grid stretch was inflating the right
+      column to match the (taller) charts column, leaving the table's
+      panel BG ending mid-content.
 
 ### Sidecar / user overrides (`flurry/sidecar.py`)
 - [x] `<logfile>.flurry.json` next to each log holds two kinds of edits:
@@ -675,23 +735,18 @@ Flurry ships as a **standalone app**, not as a CLI installer. The shape:
 
 These are documented in README.md too; this is the working list.
 
-1. **Multi-fight session reports** — average DPS per attacker across a
-   raid night. Min/max/median/p95 per fight per player. Built on top
-   of `detect_fights`. Has a natural home in the UI as a "session
-   summary" view.
-
-2. **Healing and tanking views** — same per-attacker model but for
+1. **Healing and tanking views** — same per-attacker model but for
    HPS (heals received per target) and damage mitigated/taken. Touches
    parser (new event types), analyzer (new accumulators), and reports.
 
-3. **Log diffing** — compare same-boss fights before and after a gear
+2. **Log diffing** — compare same-boss fights before and after a gear
    change. "What did this new weapon actually do?"
 
-4. **JSON export** — `flurry-dps --json`, `flurry-timeline --json`, and
+3. **JSON export** — `flurry-dps --json`, `flurry-timeline --json`, and
    `flurry-session --json` for piping to other tools. The UI has its
    own JSON via `/api/*` already; the CLI flags would just shell out.
 
-5. **Live tail mode** — `tail.py` already supports follow-mode; the
+4. **Live tail mode** — `tail.py` already supports follow-mode; the
    analyzer and server don't. Would let you watch DPS in real time
    during a fight, and push UI updates via SSE or polling.
 
