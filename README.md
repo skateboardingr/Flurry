@@ -285,6 +285,14 @@ The web UI shipped as Pass 1 (navigation only). Plausible next features:
 - **JSON export** — `--json` flags on the CLI tools for piping into
   other tools.
 - **Live tail mode** — watch DPS update in real time as the log grows.
+  - **Player overlay** — a compact, always-on-top window with four
+    counters for the active character (damage out, damage in, healing
+    out, healing in) so you can glance at your own performance mid-fight
+    without alt-tabbing to the full UI.
+  - **HP delta indicator** — net HP change over the last second
+    (damage taken + heals received), shown green for gains and red
+    for losses, so you can see trouble coming before the health bar
+    does.
 
 ## License
 

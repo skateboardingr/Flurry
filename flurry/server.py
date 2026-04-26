@@ -941,6 +941,9 @@ _INDEX_HTML = r'''<!DOCTYPE html>
   .sort-arrow { color: var(--accent); margin-left: 4px; }
 
   /* Tunable-parameters panel */
+  .params-help { margin-bottom: 12px; font-size: 0.8rem;
+                 color: var(--text-dim); line-height: 1.45; }
+  .params-help strong { color: var(--text-bright); font-weight: 600; }
   .params-row { display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap; }
   .params-row label { display: flex; flex-direction: column; gap: 4px;
                       font-size: 0.75rem; color: var(--text-dim);
@@ -1072,6 +1075,20 @@ _INDEX_HTML = r'''<!DOCTYPE html>
   .tabs .tab.active { color: var(--text-bright); border-bottom-color: var(--accent); }
 
   /* Drop-anywhere overlay shown while a file is dragged over the page */
+  /* Upload progress UI shown while bytes stream to /api/upload and the
+     server parses the log. The bar fills 0–100% during the byte transfer,
+     then the label flips to "Parsing log…" while we wait on the response. */
+  .upload-status { max-width: 480px; margin: 24px auto; padding: 20px;
+                   background: var(--panel); border: 1px solid var(--border);
+                   border-radius: 8px; }
+  .upload-label { color: var(--text); margin-bottom: 12px; font-size: 0.95rem; }
+  .upload-label strong { color: var(--text-bright); }
+  .progress-track { width: 100%; height: 8px; background: var(--row);
+                    border-radius: 4px; overflow: hidden; }
+  .progress-fill { height: 100%; background: var(--accent);
+                   transition: width 0.1s linear; }
+  .upload-pct { margin-top: 8px; font-size: 0.8rem; }
+
   .drop-overlay { position: fixed; inset: 16px; pointer-events: none;
                   border: 3px dashed var(--accent); border-radius: 12px;
                   background: rgba(96, 165, 250, 0.08);
@@ -1211,13 +1228,6 @@ function setHeader(title, sub, hasLog) {
     refresh.addEventListener('click', refreshLog);
     actions.appendChild(refresh);
 
-    const debug = document.createElement('button');
-    debug.className = 'btn';
-    debug.textContent = 'Debug';
-    debug.title = 'Parser coverage and unknown line shapes';
-    debug.addEventListener('click', () => { location.hash = '#/debug'; });
-    actions.appendChild(debug);
-
     const change = document.createElement('button');
     change.className = 'btn';
     change.textContent = 'Change log';
@@ -1337,6 +1347,10 @@ function pickerInputHTML(currentPath) {
              value="${escapeHTML(currentPath)}">
       <button class="btn" id="picker-go">Go</button>
       <button class="btn primary" id="picker-open">Open as log</button>
+      <button class="btn" id="picker-upload"
+              title="Pick a log file via the OS file dialog. The file is copied to a temp dir (browsers don't expose disk paths to JS).">Upload…</button>
+      <input type="file" id="picker-upload-input" accept=".txt,.log,.*"
+             style="display:none">
     </div>`;
 }
 
@@ -1344,11 +1358,17 @@ function wirePickerInput() {
   const input = document.getElementById('picker-input');
   const go = document.getElementById('picker-go');
   const open = document.getElementById('picker-open');
+  const uploadBtn = document.getElementById('picker-upload');
+  const uploadInput = document.getElementById('picker-upload-input');
   if (!input) return;
   go.addEventListener('click', () => renderPicker(input.value));
   open.addEventListener('click', () => openLog(input.value));
   input.addEventListener('keydown', e => {
     if (e.key === 'Enter') renderPicker(input.value);
+  });
+  uploadBtn.addEventListener('click', () => uploadInput.click());
+  uploadInput.addEventListener('change', () => {
+    if (uploadInput.files.length > 0) uploadLog(uploadInput.files[0]);
   });
 }
 
@@ -1415,7 +1435,7 @@ async function renderSession() {
   }
 
   setHeader(data.logfile_basename,
-            `fight gap ${data.params.gap_seconds}s · encounter gap ${data.params.encounter_gap_seconds}s · min damage ${NUM(data.params.min_damage)}`,
+            `min between fights ${data.params.gap_seconds}s · min between encounters ${data.params.encounter_gap_seconds}s · min damage ${NUM(data.params.min_damage)}`,
             true);
 
   const s = data.summary;
@@ -1435,11 +1455,17 @@ async function renderSession() {
 
   const paramsHTML = `
     <div class="panel">
+      <div class="params-help sub">
+        A <strong>fight</strong> is one slice of combat against a single mob name —
+        a boss and its adds become separate fights. An <strong>encounter</strong>
+        bundles overlapping or adjacent fights back into one logical engagement
+        (boss + adds = one encounter).
+      </div>
       <div class="params-row">
-        <label>Fight gap (s)
+        <label>Min time between fights (s)
           <input type="number" id="param-gap" min="0" step="1"
                  value="${data.params.gap_seconds}"
-                 title="Seconds of inactivity before a fight is considered over">
+                 title="Combat separated by at least this many seconds of inactivity becomes two fights (default 15). Lower splits aggressively; higher keeps lulls inside one fight.">
         </label>
         <label>Min damage
           <input type="number" id="param-min-damage" min="0" step="1000"
@@ -1451,10 +1477,10 @@ async function renderSession() {
                  value="${data.params.min_duration_seconds}"
                  title="Drop fights shorter than this many seconds">
         </label>
-        <label>Encounter gap (s)
+        <label>Min time between encounters (s)
           <input type="number" id="param-encounter-gap" min="0" step="1"
                  value="${data.params.encounter_gap_seconds}"
-                 title="Seconds between fights to still merge into one encounter (0 = strict overlap only)">
+                 title="Adjacent fights separated by less than this much downtime stay in the same encounter (default 10, 0 = strict overlap only).">
         </label>
         <label class="check"
                title="When on, heal events count as combat activity and keep in-progress fights alive across no-damage gaps. Heals outside any fight still don't open new ones.">
@@ -2613,26 +2639,59 @@ window.addEventListener('drop', async e => {
 
 async function uploadLog(file) {
   const app = document.getElementById('app');
-  app.innerHTML = `<div class="sub">Uploading <strong>${escapeHTML(file.name)}</strong> ` +
-                  `(${fmtSize(file.size)})…</div>`;
+  // Three-stage status: upload bytes (with %), then "Parsing…" while
+  // the server walks the log, then navigate. We use XHR rather than
+  // fetch() because fetch doesn't expose upload progress events.
+  app.innerHTML = `
+    <div class="upload-status">
+      <div class="upload-label">Uploading <strong>${escapeHTML(file.name)}</strong> (${fmtSize(file.size)})</div>
+      <div class="progress-track"><div class="progress-fill" id="upload-bar" style="width:0%"></div></div>
+      <div class="upload-pct sub" id="upload-pct">0%</div>
+    </div>`;
+
+  const setPct = txt => {
+    const el = document.getElementById('upload-pct');
+    if (el) el.textContent = txt;
+  };
+  const setBar = pct => {
+    const el = document.getElementById('upload-bar');
+    if (el) el.style.width = pct + '%';
+  };
+
   try {
-    const r = await fetch('/api/upload', {
-      method: 'POST',
-      headers: {
-        'X-Filename': encodeURIComponent(file.name),
-        'Content-Type': 'application/octet-stream',
-      },
-      body: file,
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/upload');
+      xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+      xhr.upload.addEventListener('progress', e => {
+        if (!e.lengthComputable) return;
+        const pct = Math.round(e.loaded / e.total * 100);
+        setBar(pct);
+        setPct(pct + '%');
+      });
+      // Bytes have all been sent — server is now parsing the log and
+      // building the encounter cache. Parsing time scales with log size
+      // (~10s for a 30MB log), so showing an indeterminate state here
+      // matters more than the upload bar for big files.
+      xhr.upload.addEventListener('load', () => {
+        setBar(100);
+        setPct('Parsing log…');
+      });
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300) resolve();
+        else reject(new Error(xhr.responseText || `HTTP ${xhr.status}`));
+      });
+      xhr.addEventListener('error', () => reject(new Error('Network error during upload')));
+      xhr.addEventListener('abort', () => reject(new Error('Upload aborted')));
+      xhr.send(file);
     });
-    if (!r.ok) {
-      const txt = await r.text();
-      app.innerHTML = `<div class="err">Upload failed: ${escapeHTML(txt)}</div>`;
-      return;
-    }
+
     location.hash = '#/';
     route();
   } catch (e) {
-    app.innerHTML = `<div class="err">Upload failed: ${e.message}</div>`;
+    app.innerHTML = `<div class="err">Upload failed: ${escapeHTML(e.message)}</div>`;
   }
 }
 </script>

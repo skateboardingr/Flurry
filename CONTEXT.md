@@ -610,6 +610,32 @@ These are documented in README.md too; this is the working list.
    analyzer and server don't. Would let you watch DPS in real time
    during a fight, and push UI updates via SSE or polling.
 
+   - **Player overlay (sub-feature of live tail).** A compact,
+     always-on-top window for the active character with four live
+     counters: damage out, damage in, healing out, healing in. The
+     idea is to glance at your own performance mid-fight without
+     alt-tabbing to the full UI. Open questions: which char is "you"
+     (read from the log filename `eqlog_<char>_<server>.txt`, or let
+     the user pick from a roster?), how to render an always-on-top
+     window stdlib-only (probably can't — likely needs a small Tk or
+     wx layer, or a borderless browser pop-out from the existing
+     server), and whether the counters reset per-fight or per-encounter
+     or run as rolling N-second windows. Worth deciding all three
+     before building.
+
+   - **HP delta indicator (sub-feature of live tail).** A live readout
+     of net HP change over the last second — green when net positive
+     (heal > damage taken), red when net negative — so you can spot
+     trouble before the health bar gets to it. Derived from log events
+     (damage-taken + heals-received summed over a rolling window),
+     since EQ doesn't continuously emit absolute HP. Open questions:
+     rolling-1s vs fixed-bucket aggregation, a "no change" threshold so
+     small ticks don't flicker the color, and whether this lives inside
+     the player overlay or as a separate always-on-top widget. Probably
+     same window as the overlay above, but cleanly factor the delta
+     calculation so a future "raid HP deltas for the whole group"
+     feature can reuse it.
+
 ---
 
 ## Conventions
