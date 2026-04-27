@@ -4120,8 +4120,20 @@ function showPairChart(pair, labels, bucketSeconds, metricArg) {
   // individual events to credit. Damage and healing keep their full
   // by-source table even when the toggle is present.
   const showSourcePanel = !isDelta;
-  const subTotal = primaryTotal;
-  const subCount = allHits.length;
+  // Modal subtitle. Damage/healing show value + count of underlying
+  // events. Delta has no per-event records, so we show the underlying
+  // damage and heal totals so the user can sanity-check the chart's
+  // amplitude against the inputs at a glance.
+  let subLine;
+  if (isDelta) {
+    const dmgTotal = pair.damage || 0;
+    const healTotal = pair.heals_total || 0;
+    const net = healTotal - dmgTotal;
+    const sign = net > 0 ? '+' : '';
+    subLine = `${NUM(dmgTotal)} damage taken · ${NUM(healTotal)} healing received · ${sign}${NUM(net)} net life`;
+  } else {
+    subLine = `${NUM(primaryTotal)} ${amountLabel} · ${NUM(allHits.length)} ${countLabel}`;
+  }
   const toggleHTML = !supportsToggle ? '' : `
     <div class="pair-metric-toggle">
       ${['damage', 'healing', 'delta'].map(k => {
@@ -4142,7 +4154,7 @@ function showPairChart(pair, labels, bucketSeconds, metricArg) {
       <div class="pair-modal-head">
         <div>
           <h3>${escapeHTML(pair.attacker)} → ${escapeHTML(pair.target)}</h3>
-          <div class="modal-sub" id="pair-sub">${NUM(subTotal)} ${amountLabel} · ${subCount} ${countLabel}</div>
+          <div class="modal-sub" id="pair-sub">${subLine}</div>
         </div>
         ${toggleHTML}
       </div>
@@ -4430,7 +4442,11 @@ function showPairChart(pair, labels, bucketSeconds, metricArg) {
   // events to drill into, so windowing has nothing to show.
   const canvas = pairChartInstance.canvas;
   if (isDelta) {
-    refresh();
+    // Skip refresh() and the pointer-event wiring entirely. refresh()
+    // recomputes the subtitle and stats from `allHits` — which is empty
+    // for delta — and would clobber the informative damage/healing/net
+    // subtitle we already wrote. There are no individual events to
+    // window or filter in delta either, so nothing useful to wire up.
     return;
   }
   canvas.addEventListener('pointerdown', ev => {
