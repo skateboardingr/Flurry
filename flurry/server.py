@@ -333,36 +333,121 @@ def _fight_detail(f: FightResult, bucket_seconds: int = 5) -> dict:
     }
 
 
+def _build_session_actor_rollup(
+    encounters: List[Encounter],
+    encounter_ids_order: List[int],
+    per_encounter_actors,
+    sides: dict,
+) -> List[dict]:
+    """Generic per-actor rollup builder used for all three session modes
+    (damage, healing, tanking). Same shape across modes — only the source
+    of `value` per encounter differs.
+
+    Args:
+      encounters: ordered Encounter list (same order as encounter_ids_order).
+      encounter_ids_order: encounter ids in chronological order; used to
+        align each actor's per-encounter arrays for the heatmap/chart.
+      per_encounter_actors: callable(encounter) -> dict[lower_name, dict]
+        where each inner dict has {'name': canonical, 'value': int,
+        'biggest': int}. 'value' is the absolute value (damage / healing
+        / damage_taken) for that actor in that encounter; 'biggest' is
+        the largest single event seen.
+      sides: lookup of lower_name -> 'friendly'|'enemy' (precomputed at
+        session level using the damage classifier so the same actor
+        stays on the same side across all three tabs).
+
+    Returns rows with the same shape regardless of mode:
+      attacker: str
+      side: 'friendly' | 'enemy'
+      total: int
+      avg_rate / median_rate / p95_rate / best_rate: int (per second)
+      biggest: int
+      encounters_present: int
+      per_encounter_rate: list[int]   (aligned to encounter_ids_order)
+      per_encounter_value: list[int]
+    """
+    by_actor: dict = {}
+    for e in encounters:
+        duration = e.duration_seconds or 1.0
+        for key, info in per_encounter_actors(e).items():
+            rec = by_actor.setdefault(key, {
+                'name': info['name'],
+                'total': 0,
+                'biggest': 0,
+                'per_encounter_rate': {},
+                'per_encounter_value': {},
+            })
+            rec['total'] += info['value']
+            if info['biggest'] > rec['biggest']:
+                rec['biggest'] = info['biggest']
+            rec['per_encounter_rate'][e.encounter_id] = round(info['value'] / duration)
+            rec['per_encounter_value'][e.encounter_id] = info['value']
+
+    out = []
+    for key, rec in by_actor.items():
+        rates = [v for v in rec['per_encounter_rate'].values() if v > 0]
+        if not rates:
+            continue
+        avg = round(sum(rates) / len(rates))
+        median = round(statistics.median(rates))
+        # P95 collapses toward best for small N (most logs have <20
+        # encounters); use the max in that regime to avoid a misleading
+        # "P95 = best" duplicate column.
+        if len(rates) >= 20:
+            p95 = sorted(rates, reverse=True)[int(len(rates) * 0.05)]
+        else:
+            p95 = max(rates)
+        best = max(rates)
+        out.append({
+            'attacker': rec['name'],
+            'side': sides.get(key, 'friendly'),
+            'total': rec['total'],
+            'avg_rate': avg,
+            'median_rate': median,
+            'p95_rate': p95,
+            'best_rate': best,
+            'biggest': rec['biggest'],
+            'encounters_present': len(rates),
+            'per_encounter_rate': [rec['per_encounter_rate'].get(eid, 0)
+                                   for eid in encounter_ids_order],
+            'per_encounter_value': [rec['per_encounter_value'].get(eid, 0)
+                                    for eid in encounter_ids_order],
+        })
+    out.sort(key=lambda x: x['total'], reverse=True)
+    return out
+
+
 def _session_summary_payload(encounters: List[Encounter],
                              killed_only: bool = False,
                              encounter_ids: Optional[set] = None) -> dict:
-    """Aggregate per-attacker stats across all encounters in the session.
+    """Aggregate per-actor stats across all encounters in the session, in
+    three parallel rollups (damage, healing, tanking).
 
     Builds the data behind the multi-fight session-summary view:
       - Header totals (start/end, duration, encounter and kill counts).
-      - Per-attacker rollup: total damage, avg/median/p95/best DPS over
-        the encounters where they appeared, biggest hit, encounter count.
-      - Per-(attacker, encounter) DPS arrays so the front-end can draw
-        the trend chart and heatmap without a second roundtrip.
+      - `damage_actors`: per-attacker rollup with DPS rates.
+      - `healing_actors`: per-healer rollup with HPS rates.
+      - `tanking_actors`: per-defender rollup with DTPS rates (damage
+        taken per second).
+      - `encounters`: per-encounter metadata for chart x-axis labels.
+
+    All three rollups share the same row shape (`total`, `avg_rate`,
+    `per_encounter_rate`, etc.) so the front-end can swap modes via a
+    single render path. Side classification is computed once at the
+    session level using the damage classifier (`received > dealt + healed`)
+    and applied to all three rollups so an actor stays on the same side
+    across tabs — a healer who only took AoE damage shows friendly in
+    the tanking tab same as in the damage tab.
 
     `killed_only=True` filters to encounters with `fight_complete=True`
-    so wipes / partial pulls don't drag down a player's averages — most
-    useful for raid-night stats. Default False to match the session
-    table's full set; the front-end has its own toggle.
+    so wipes / partial pulls don't drag down averages — most useful for
+    raid-night stats. Default False to match the session table's full
+    set; the front-end has its own toggle.
 
     `encounter_ids`, when provided, restricts the rollup to that subset
-    (matched on `Encounter.encounter_id`). Used by the session view's
-    "Session summary (N selected)" path: the user ticks specific
-    encounters and gets a rollup scoped to just those. Applied AFTER
-    `killed_only` so explicit selection always wins — if the user
-    picked an incomplete fight, we honor that.
-
-    Friendly/enemy classification is computed at the SESSION level using
-    the same `received > dealt + healed` rule the encounter detail view
-    uses: a healer who only takes AoE damage stays friendly because
-    their healing output counts on the active side. Enemies that
-    self-heal get classified correctly because incoming raid damage
-    swamps their self-heal totals.
+    (matched on `Encounter.encounter_id`). Used by the "Session summary
+    (N selected)" path. Applied AFTER `killed_only` so explicit
+    selection always wins.
     """
     if killed_only:
         encounters = [e for e in encounters if e.fight_complete]
@@ -373,8 +458,10 @@ def _session_summary_payload(encounters: List[Encounter],
             'start': None, 'end': None,
             'duration_seconds': 0,
             'encounter_count': 0, 'killed_count': 0,
-            'total_damage': 0, 'total_healing': 0,
-            'attackers': [],
+            'total_damage': 0, 'total_healing': 0, 'total_damage_taken': 0,
+            'damage_actors': [],
+            'healing_actors': [],
+            'tanking_actors': [],
             'encounters': [],
             'killed_only': killed_only,
             'scoped': encounter_ids is not None,
@@ -384,121 +471,84 @@ def _session_summary_payload(encounters: List[Encounter],
     # columns read left-to-right in time.
     encounters = sorted(encounters, key=lambda e: e.start or datetime.min)
 
-    encounter_meta = []
+    encounter_meta = [{
+        'encounter_id': e.encounter_id,
+        'name': _encounter_summary(e)['name'],
+        'duration_seconds': round(e.duration_seconds, 1),
+        'fight_complete': e.fight_complete,
+        'start': e.start.strftime('%Y-%m-%d %H:%M:%S') if e.start else None,
+    } for e in encounters]
+    encounter_ids_order = [m['encounter_id'] for m in encounter_meta]
+
+    # Pre-merge encounters once; healing/tanking blocks reuse the same
+    # merged result the damage block walks.
+    merged_by_eid = {e.encounter_id: merge_encounter(e) for e in encounters}
+
+    # ---- Side classification (computed once, applied to all 3 modes) ----
+    # Same rule the encounter detail view uses — `received > dealt + healed`
+    # at the session level — so an actor's side stays consistent across
+    # tabs. Pets always friendly via the backtick suffix.
+    canonical: dict = {}
+    sums = {}  # lower_name -> {'damage', 'received', 'healed'}
+    def _bump(lo, canon, **deltas):
+        canonical.setdefault(lo, canon)
+        rec = sums.setdefault(lo, {'damage': 0, 'received': 0, 'healed': 0})
+        for k, v in deltas.items():
+            rec[k] += v
     for e in encounters:
-        encounter_meta.append({
-            'encounter_id': e.encounter_id,
-            'name': _encounter_summary(e)['name'],
-            'duration_seconds': round(e.duration_seconds, 1),
-            'fight_complete': e.fight_complete,
-            'start': e.start.strftime('%Y-%m-%d %H:%M:%S') if e.start else None,
-        })
-
-    # Per-attacker accumulators. Keyed by lowercased name; canonical
-    # casing is captured from the first occurrence so the table reads
-    # naturally even if EQ used inconsistent casing across encounters.
-    by_attacker: dict = {}
-
-    for e in encounters:
-        merged = merge_encounter(e)
-        duration = merged.duration_seconds or 1.0
-
-        # Damage taken in this encounter, keyed by lowercased target.
-        # Targets aren't rewritten so this works for raw + rewritten
-        # alike — same shape as the encounter detail classifier.
-        received_in_enc: dict = {}
+        merged = merged_by_eid[e.encounter_id]
+        for atk, s in merged.stats_by_attacker.items():
+            _bump(atk.lower(), atk, damage=s.damage)
         for m in e.members:
-            received_in_enc[m.target.lower()] = (
-                received_in_enc.get(m.target.lower(), 0) + m.total_damage)
-        # Healing dispensed in this encounter, keyed by healer.
-        heal_in_enc: dict = {}
+            _bump(m.target.lower(), m.target, received=m.total_damage)
         for h in e.heals:
-            heal_in_enc[h.healer.lower()] = (
-                heal_in_enc.get(h.healer.lower(), 0) + h.amount)
-
-        seen_attackers = set()
-        for atk_name, s in merged.stats_by_attacker.items():
-            key = atk_name.lower()
-            seen_attackers.add(key)
-            by = by_attacker.setdefault(key, {
-                'attacker': atk_name, 'damage': 0, 'received': 0,
-                'healed': 0, 'biggest': 0,
-                'per_encounter_dps': {},
-                'per_encounter_damage': {},
-            })
-            by['damage'] += s.damage
-            by['biggest'] = max(by['biggest'], s.biggest)
-            by['per_encounter_dps'][e.encounter_id] = round(s.damage / duration)
-            by['per_encounter_damage'][e.encounter_id] = s.damage
-
-        # Layer in received / healed for everyone, including actors who
-        # only got hit or only healed. They might not have an attacker
-        # row yet — bring them in so the classifier sees the full
-        # picture (a pure healer who never landed a hit still needs to
-        # be classified for completeness, even if filtered out below).
-        for tgt_lo, dmg in received_in_enc.items():
-            by = by_attacker.setdefault(tgt_lo, {
-                'attacker': tgt_lo, 'damage': 0, 'received': 0,
-                'healed': 0, 'biggest': 0,
-                'per_encounter_dps': {}, 'per_encounter_damage': {},
-            })
-            by['received'] += dmg
-        for healer_lo, amt in heal_in_enc.items():
-            by = by_attacker.setdefault(healer_lo, {
-                'attacker': healer_lo, 'damage': 0, 'received': 0,
-                'healed': 0, 'biggest': 0,
-                'per_encounter_dps': {}, 'per_encounter_damage': {},
-            })
-            by['healed'] += amt
-
-    encounter_ids = [m['encounter_id'] for m in encounter_meta]
-
-    # Build the per-attacker output rows, computing summary stats over
-    # the encounters where the attacker actually appeared (non-zero
-    # damage). Empty rows (someone who only took damage) drop out of
-    # the rollup; they have nothing to display.
-    attackers_out = []
-    for key, by in by_attacker.items():
-        dps_values = [v for v in by['per_encounter_dps'].values() if v > 0]
-        if not dps_values:
-            continue
-        # Side classification: same rule as _encounter_payload uses
-        # per-encounter, applied at the session level. Pets always
-        # friendly via the backtick suffix.
-        if by['attacker'].endswith('`s pet'):
-            side = 'friendly'
+            _bump(h.healer.lower(), h.healer, healed=h.amount)
+    sides: dict = {}
+    for lo, rec in sums.items():
+        if canonical[lo].endswith('`s pet'):
+            sides[lo] = 'friendly'
         else:
-            side = ('enemy' if by['received'] > by['damage'] + by['healed']
-                    else 'friendly')
+            sides[lo] = ('enemy' if rec['received'] > rec['damage'] + rec['healed']
+                         else 'friendly')
 
-        avg_dps = round(sum(dps_values) / len(dps_values))
-        median_dps = round(statistics.median(dps_values))
-        # P95: top-5% encounter. For small N (which is most logs), the
-        # p95 collapses toward the best, so we just use max for N<20.
-        if len(dps_values) >= 20:
-            p95_dps = sorted(dps_values, reverse=True)[int(len(dps_values) * 0.05)]
-        else:
-            p95_dps = max(dps_values)
-        best_dps = max(dps_values)
+    # ---- Damage actors ----
+    def damage_actors_for(e):
+        out = {}
+        for atk, s in merged_by_eid[e.encounter_id].stats_by_attacker.items():
+            out[atk.lower()] = {'name': atk, 'value': s.damage, 'biggest': s.biggest}
+        return out
+    damage_actors = _build_session_actor_rollup(
+        encounters, encounter_ids_order, damage_actors_for, sides)
 
-        attackers_out.append({
-            'attacker': by['attacker'],
-            'side': side,
-            'total_damage': by['damage'],
-            'avg_dps': avg_dps,
-            'median_dps': median_dps,
-            'p95_dps': p95_dps,
-            'best_dps': best_dps,
-            'biggest': by['biggest'],
-            'encounters_present': len(dps_values),
-            # Aligned to encounter_ids order; 0 means "didn't show up".
-            # The heatmap uses this directly to color cells.
-            'per_encounter_dps': [by['per_encounter_dps'].get(eid, 0)
-                                  for eid in encounter_ids],
-            'per_encounter_damage': [by['per_encounter_damage'].get(eid, 0)
-                                     for eid in encounter_ids],
-        })
-    attackers_out.sort(key=lambda x: x['total_damage'], reverse=True)
+    # ---- Healing actors ----
+    def healing_actors_for(e):
+        out = {}
+        for h in e.heals:
+            key = h.healer.lower()
+            rec = out.setdefault(key, {'name': h.healer, 'value': 0, 'biggest': 0})
+            rec['value'] += h.amount
+            if h.amount > rec['biggest']:
+                rec['biggest'] = h.amount
+        return out
+    healing_actors = _build_session_actor_rollup(
+        encounters, encounter_ids_order, healing_actors_for, sides)
+
+    # ---- Tanking actors (per-defender) ----
+    # Aggregates damage_taken across all attackers per defender. Biggest
+    # is the largest single hit taken (max across pairs).
+    def tanking_actors_for(e):
+        out = {}
+        for (_, def_name), d in merged_by_eid[e.encounter_id].defends_by_pair.items():
+            if d.damage_taken == 0:
+                continue
+            key = def_name.lower()
+            rec = out.setdefault(key, {'name': def_name, 'value': 0, 'biggest': 0})
+            rec['value'] += d.damage_taken
+            if d.biggest_taken > rec['biggest']:
+                rec['biggest'] = d.biggest_taken
+        return out
+    tanking_actors = _build_session_actor_rollup(
+        encounters, encounter_ids_order, tanking_actors_for, sides)
 
     starts = [e.start for e in encounters if e.start]
     ends = [e.end for e in encounters if e.end]
@@ -510,7 +560,10 @@ def _session_summary_payload(encounters: List[Encounter],
         'killed_count': sum(1 for e in encounters if e.fight_complete),
         'total_damage': sum(e.total_damage for e in encounters),
         'total_healing': sum(e.total_healing for e in encounters),
-        'attackers': attackers_out,
+        'total_damage_taken': sum(t['total'] for t in tanking_actors),
+        'damage_actors': damage_actors,
+        'healing_actors': healing_actors,
+        'tanking_actors': tanking_actors,
         'encounters': encounter_meta,
         'killed_only': killed_only,
         'scoped': encounter_ids is not None,
@@ -3388,11 +3441,48 @@ async function renderEncounter(id) {
 // State (sessionSummarySettings) is module-scope so toggling killed-only
 // or the min-DPS filter doesn't lose state on navigation back.
 
+// Per-mode config for the session-summary view. The three tabs (damage,
+// healing, tanking) all run through the same render path; this table is
+// the only place mode differences live.
+const SS_MODES = {
+  damage: {
+    label: 'Damage',
+    actorsField: 'damage_actors',
+    totalField: 'total_damage',
+    rateLabel: 'DPS',
+    valueLabel: 'damage',
+    actorLabel: 'Attacker',
+    actorPlural: 'attackers',
+    totalSuffix: 'damage',
+  },
+  healing: {
+    label: 'Healing',
+    actorsField: 'healing_actors',
+    totalField: 'total_healing',
+    rateLabel: 'HPS',
+    valueLabel: 'healing',
+    actorLabel: 'Healer',
+    actorPlural: 'healers',
+    totalSuffix: 'healing',
+  },
+  tanking: {
+    label: 'Tanking',
+    actorsField: 'tanking_actors',
+    totalField: 'total_damage_taken',
+    rateLabel: 'DTPS',
+    valueLabel: 'damage taken',
+    actorLabel: 'Defender',
+    actorPlural: 'defenders',
+    totalSuffix: 'damage taken',
+  },
+};
+
 let sessionSummarySettings = {
   killedOnly: true,   // raid wipes drag down averages — default-filter them
-  minDps: 0,          // hide rows below this avg DPS (the table tails get
-                      // long otherwise)
+  minRate: 0,         // hide rows below this avg rate (the table tails get
+                      // long otherwise) — units depend on active mode
   trendTopN: 10,      // chart legend cap; rest collapse into "Other"
+  mode: 'damage',     // 'damage' | 'healing' | 'tanking'
 };
 let sessionSummaryChart = null;
 
@@ -3426,9 +3516,14 @@ async function renderSessionSummary(scopedIds) {
             scopeLabel,
             true);
 
-  const friendlies = data.attackers.filter(a => a.side === 'friendly')
-                                    .filter(a => a.avg_dps >= sessionSummarySettings.minDps);
-  const enemies = data.attackers.filter(a => a.side === 'enemy');
+  // Active mode + helpers. Each mode sources from a different actors
+  // array on the payload (damage_actors / healing_actors / tanking_actors)
+  // but they all share the same row shape so the render path is uniform.
+  const mode = SS_MODES[sessionSummarySettings.mode] || SS_MODES.damage;
+  const allActors = data[mode.actorsField] || [];
+  const friendlies = allActors.filter(a => a.side === 'friendly')
+                              .filter(a => a.avg_rate >= sessionSummarySettings.minRate);
+  const enemies = allActors.filter(a => a.side === 'enemy');
 
   if (data.encounter_count === 0) {
     let hint;
@@ -3446,6 +3541,18 @@ async function renderSessionSummary(scopedIds) {
     return;
   }
 
+  // Tab badge totals come from the payload's totals so they reflect the
+  // currently-loaded slice (killed_only / scoped) without having to sum
+  // each actors array client-side.
+  const tabsHTML = ['damage', 'healing', 'tanking'].map(k => {
+    const m = SS_MODES[k];
+    const total = data[m.totalField] || 0;
+    const isActive = k === sessionSummarySettings.mode;
+    return `<button class="tab ${isActive ? 'active' : ''}" data-ss-mode="${k}">
+      ${m.label} (${NUM(total)})
+    </button>`;
+  }).join('');
+
   app.innerHTML = `
     <a href="#/" class="back">← back</a>
     <div class="panel">
@@ -3460,6 +3567,7 @@ async function renderSessionSummary(scopedIds) {
           <div class="value">${FMT_DUR(data.duration_seconds)}</div></div>
       </div>
     </div>
+    <div class="tabs">${tabsHTML}</div>
     <div class="panel">
       <div class="params-row">
         <label class="check"
@@ -3469,13 +3577,13 @@ async function renderSessionSummary(scopedIds) {
                  ${scoped ? 'disabled' : ''}>
           Killed encounters only
         </label>
-        <label>Min avg DPS
-          <input type="number" id="ss-min-dps" min="0" step="100"
-                 value="${sessionSummarySettings.minDps}"
-                 title="Hide rollup rows whose avg DPS is below this. Useful for hiding low-impact actors that pad the table.">
+        <label>Min avg ${mode.rateLabel}
+          <input type="number" id="ss-min-rate" min="0" step="100"
+                 value="${sessionSummarySettings.minRate}"
+                 title="Hide rollup rows whose avg ${mode.rateLabel} is below this. Useful for hiding low-impact actors that pad the table.">
         </label>
         <span class="sub" style="align-self:center; font-size:0.85rem;">
-          Showing <strong>${friendlies.length}</strong> friendly attackers
+          Showing <strong>${friendlies.length}</strong> friendly ${mode.actorPlural}
           ${enemies.length > 0 ? `· ${enemies.length} enemies tracked separately` : ''}
         </span>
         ${scoped ? `<a href="#/session-summary" class="btn"
@@ -3486,38 +3594,50 @@ async function renderSessionSummary(scopedIds) {
     <div class="ss-grid">
       <div class="ss-charts">
         <div class="panel">
-          <h3 class="ss-section-h">DPS by encounter <span class="sub">— top ${Math.min(sessionSummarySettings.trendTopN, friendlies.length)}</span></h3>
+          <h3 class="ss-section-h">${mode.rateLabel} by encounter <span class="sub">— top ${Math.min(sessionSummarySettings.trendTopN, friendlies.length)}</span></h3>
           <div class="chart-wrap" style="background: transparent; padding: 0; margin: 0;">
             <canvas id="ss-trend-chart" height="200"></canvas>
           </div>
         </div>
         <div class="panel">
-          <h3 class="ss-section-h">Attacker × encounter heatmap
+          <h3 class="ss-section-h">${mode.actorLabel} × encounter heatmap
             <span class="sub">— click a cell to drill in</span></h3>
-          ${ssHeatmapHTML(friendlies, data.encounters)}
+          ${ssHeatmapHTML(friendlies, data.encounters, mode)}
         </div>
       </div>
       <div class="ss-table-col">
         <div class="panel">
-          <h3 class="ss-section-h">Per-attacker rollup</h3>
-          ${ssTableHTML(friendlies)}
+          <h3 class="ss-section-h">Per-${mode.actorLabel.toLowerCase()} rollup</h3>
+          ${ssTableHTML(friendlies, mode)}
         </div>
       </div>
     </div>`;
 
-  // Wire toggles. Both re-fetch / re-render so the data stays
-  // consistent — killedOnly hits the server, minDps is client-side.
-  // Pass scopedIds through so toggling a filter doesn't drop the
-  // selection-scope. (When scoped, killedOnly is disabled in the UI
-  // anyway, but the min-DPS input still re-renders.)
+  // Wire toggles. killedOnly hits the server (it changes which
+  // encounters are aggregated); the others re-render client-side off
+  // the cached payload. We always call renderSessionSummary which
+  // re-fetches — simpler than caching the payload across renders, and
+  // the killed-only path already needs the fetch.
   document.getElementById('ss-killed-only').addEventListener('change', e => {
     sessionSummarySettings.killedOnly = e.target.checked;
     renderSessionSummary(scopedIds);
   });
-  document.getElementById('ss-min-dps').addEventListener('change', e => {
+  document.getElementById('ss-min-rate').addEventListener('change', e => {
     const v = parseInt(e.target.value, 10);
-    sessionSummarySettings.minDps = (Number.isNaN(v) || v < 0) ? 0 : v;
+    sessionSummarySettings.minRate = (Number.isNaN(v) || v < 0) ? 0 : v;
     renderSessionSummary(scopedIds);
+  });
+  // Tab buttons swap mode and re-render. Min-rate filter resets to 0
+  // because the units differ — a "Min DPS = 1000" threshold doesn't map
+  // sensibly to "Min HPS = 1000" or "Min DTPS = 1000".
+  app.querySelectorAll('.tabs .tab[data-ss-mode]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const m = btn.dataset.ssMode;
+      if (m === sessionSummarySettings.mode) return;
+      sessionSummarySettings.mode = m;
+      sessionSummarySettings.minRate = 0;
+      renderSessionSummary(scopedIds);
+    });
   });
 
   // Wire heatmap cell clicks. data-encounter-id navigates to that
@@ -3528,15 +3648,15 @@ async function renderSessionSummary(scopedIds) {
     });
   });
 
-  // Build the trend chart. Top-N attackers get their own line; the
-  // rest are summed into an "Other" line so the legend stays readable.
+  // Build the trend chart. Top-N actors get their own line; the rest
+  // are summed into an "Other" line so the legend stays readable.
   const topN = sessionSummarySettings.trendTopN;
   const top = friendlies.slice(0, topN);
   const rest = friendlies.slice(topN);
   const labels = data.encounters.map(m => `#${m.encounter_id}`);
   const datasets = top.map((a, i) => ({
     label: a.attacker,
-    data: a.per_encounter_dps,
+    data: a.per_encounter_rate,
     backgroundColor: COLORS[i % COLORS.length] + '33',
     borderColor: COLORS[i % COLORS.length],
     borderWidth: 1.5, fill: false, pointRadius: 2, tension: 0.2,
@@ -3544,7 +3664,7 @@ async function renderSessionSummary(scopedIds) {
   }));
   if (rest.length > 0) {
     const otherSeries = data.encounters.map((_, idx) =>
-      rest.reduce((s, a) => s + (a.per_encounter_dps[idx] || 0), 0));
+      rest.reduce((s, a) => s + (a.per_encounter_rate[idx] || 0), 0));
     datasets.push({
       label: `Other (${rest.length})`, data: otherSeries,
       backgroundColor: COLORS[8] + '33', borderColor: COLORS[8],
@@ -3565,7 +3685,7 @@ async function renderSessionSummary(scopedIds) {
           x: { ticks: { color: '#94a3b8' }, grid: { color: '#2a3142' } },
           y: { beginAtZero: true,
                ticks: { color: '#94a3b8',
-                        callback: v => SHORT(v) + ' DPS' },
+                        callback: v => SHORT(v) + ' ' + mode.rateLabel },
                grid: { color: '#2a3142' } },
         },
         plugins: {
@@ -3578,7 +3698,7 @@ async function renderSessionSummary(scopedIds) {
                 const status = enc.fight_complete ? 'killed' : 'incomplete';
                 return `#${enc.encounter_id}: ${enc.name} (${status})`;
               },
-              label: ctx => `${ctx.dataset.label}: ${SHORT(ctx.parsed.y)} DPS`,
+              label: ctx => `${ctx.dataset.label}: ${SHORT(ctx.parsed.y)} ${mode.rateLabel}`,
             },
           },
         },
@@ -3587,39 +3707,39 @@ async function renderSessionSummary(scopedIds) {
   }
 }
 
-function ssTableHTML(rows) {
+function ssTableHTML(rows, mode) {
   if (rows.length === 0) {
-    return '<div class="sub">Nothing to show — try lowering the Min avg DPS filter.</div>';
+    return `<div class="sub">Nothing to show — try lowering the Min avg ${mode.rateLabel} filter.</div>`;
   }
   // Wrap in an overflow-x scroller — the 8-column table has a
   // min-content width that exceeds the right grid column on narrower
   // viewports / longer attacker names. Without the wrapper the table
   // bleeds past the panel BG.
+  const totalAll = rows.reduce((s, r) => s + r.total, 0) || 1;
   return `
     <div class="ss-table-wrap">
     <table class="ss-table">
       <thead><tr>
-        <th>Attacker</th>
+        <th>${mode.actorLabel}</th>
         <th class="num">Total</th>
         <th class="num">% raid</th>
-        <th class="num">Avg DPS</th>
+        <th class="num">Avg ${mode.rateLabel}</th>
         <th class="num">Median</th>
         <th class="num">P95</th>
         <th class="num">Best</th>
-        <th class="num" title="Encounters where this attacker dealt nonzero damage">Pres.</th>
+        <th class="num" title="Encounters where this ${mode.actorLabel.toLowerCase()} had nonzero ${mode.valueLabel}">Pres.</th>
       </tr></thead>
       <tbody>${rows.map(a => {
-        const totalAll = rows.reduce((s, r) => s + r.total_damage, 0) || 1;
-        const pct = (a.total_damage / totalAll * 100).toFixed(1);
+        const pct = (a.total / totalAll * 100).toFixed(1);
         return `
           <tr>
             <td class="target">${escapeHTML(a.attacker)}</td>
-            <td class="num">${NUM(a.total_damage)}</td>
+            <td class="num">${NUM(a.total)}</td>
             <td class="num">${pct}%</td>
-            <td class="num">${NUM(a.avg_dps)}</td>
-            <td class="num">${NUM(a.median_dps)}</td>
-            <td class="num">${NUM(a.p95_dps)}</td>
-            <td class="num">${NUM(a.best_dps)}</td>
+            <td class="num">${NUM(a.avg_rate)}</td>
+            <td class="num">${NUM(a.median_rate)}</td>
+            <td class="num">${NUM(a.p95_rate)}</td>
+            <td class="num">${NUM(a.best_rate)}</td>
             <td class="num">${a.encounters_present}</td>
           </tr>`;
       }).join('')}</tbody>
@@ -3627,23 +3747,23 @@ function ssTableHTML(rows) {
     </div>`;
 }
 
-function ssHeatmapHTML(rows, encounters) {
+function ssHeatmapHTML(rows, encounters, mode) {
   if (rows.length === 0 || encounters.length === 0) {
     return '<div class="sub">No data.</div>';
   }
-  // Color intensity scales with DPS / max DPS observed in the matrix.
+  // Color intensity scales with rate / max rate observed in the matrix.
   // Not log-scaled — most encounters cluster within an order of
   // magnitude of each other; if that turns out to be wrong on real
-  // raid data we can switch to log. Cells with zero damage render
-  // empty (no fill) so absences are visually distinct from low-DPS
-  // encounters where the player did show up.
-  let maxDps = 0;
+  // raid data we can switch to log. Cells with zero render empty
+  // (no fill) so absences are visually distinct from low-rate
+  // encounters where the actor did show up.
+  let maxRate = 0;
   for (const a of rows) {
-    for (const v of a.per_encounter_dps) {
-      if (v > maxDps) maxDps = v;
+    for (const v of a.per_encounter_rate) {
+      if (v > maxRate) maxRate = v;
     }
   }
-  if (maxDps === 0) maxDps = 1;
+  if (maxRate === 0) maxRate = 1;
 
   const headerCells = encounters.map(m => {
     const status = m.fight_complete ? 'killed' : 'incomplete';
@@ -3652,20 +3772,20 @@ function ssHeatmapHTML(rows, encounters) {
   }).join('');
 
   const bodyRows = rows.map(a => {
-    const cells = a.per_encounter_dps.map((dps, idx) => {
+    const cells = a.per_encounter_rate.map((rate, idx) => {
       const enc = encounters[idx];
-      if (dps === 0) {
+      if (rate === 0) {
         return `<td class="ss-heatmap-empty"
                     data-encounter-id="${enc.encounter_id}"
                     title="${escapeHTML(a.attacker)} — absent from #${enc.encounter_id}: ${escapeHTML(enc.name)}">·</td>`;
       }
       // Intensity in [0.15, 1.0] so even small values get a visible
       // fill; pure 0..1 makes 5%-of-max cells nearly invisible.
-      const alpha = 0.15 + 0.85 * (dps / maxDps);
+      const alpha = 0.15 + 0.85 * (rate / maxRate);
       return `<td class="ss-heatmap-cell"
                   style="background: rgba(96, 165, 250, ${alpha.toFixed(3)})"
                   data-encounter-id="${enc.encounter_id}"
-                  title="${escapeHTML(a.attacker)} — ${SHORT(dps)} DPS in #${enc.encounter_id}: ${escapeHTML(enc.name)}">${SHORT(dps)}</td>`;
+                  title="${escapeHTML(a.attacker)} — ${SHORT(rate)} ${mode.rateLabel} in #${enc.encounter_id}: ${escapeHTML(enc.name)}">${SHORT(rate)}</td>`;
     }).join('');
     return `<tr>
       <th class="ss-heatmap-row-h" title="${escapeHTML(a.attacker)}">${escapeHTML(a.attacker)}</th>
@@ -4537,12 +4657,24 @@ async function uploadLog(file) {
     if (el) el.style.width = pct + '%';
   };
 
-  // Parse-status poller, started when upload bytes finish and the
-  // server transitions into parsing. Stopped when the XHR resolves.
+  // Parse-status poller. Started early (right after the XHR is sent) so
+  // the UI flip from Uploading → Parsing is driven by the server-side
+  // parse_progress state rather than xhr.upload.load — that event is
+  // unreliable across browsers when the server holds the connection
+  // open through a slow parse, leaving the UI stuck at "Uploading 100%"
+  // until the server finally responds.
   let stopPoll = null;
+  let phase = 'upload';   // 'upload' -> 'parse' (one-way transition)
   const setLabel = txt => {
     const el = document.querySelector('#app .upload-label');
     if (el) el.innerHTML = txt;
+  };
+  const flipToParsing = () => {
+    if (phase !== 'upload') return;
+    phase = 'parse';
+    setBar(0);
+    setPct('Parsing log…');
+    setLabel(`Parsing <strong>${escapeHTML(file.name)}</strong>`);
   };
 
   try {
@@ -4553,30 +4685,14 @@ async function uploadLog(file) {
       xhr.setRequestHeader('Content-Type', 'application/octet-stream');
 
       xhr.upload.addEventListener('progress', e => {
-        if (!e.lengthComputable) return;
+        if (phase !== 'upload' || !e.lengthComputable) return;
         const pct = Math.round(e.loaded / e.total * 100);
         setBar(pct);
         setPct(pct + '%');
       });
-      // Bytes have all been sent — server is now parsing the log. Flip
-      // the bar to 0% and start polling /api/parse-status to drive a
-      // real progress fill instead of the previous indeterminate label.
-      xhr.upload.addEventListener('load', () => {
-        setBar(0);
-        setPct('Parsing log…');
-        setLabel(`Parsing <strong>${escapeHTML(file.name)}</strong>`);
-        stopPoll = startParsePoll(s => {
-          if (s.state === 'parsing') {
-            setBar(s.pct);
-            const note = (s.total_bytes > 0)
-              ? `${fmtMB(s.bytes_read)} / ${fmtMB(s.total_bytes)} · ${s.pct.toFixed(1)}%`
-              : `${s.pct.toFixed(1)}%`;
-            setPct(note);
-          } else if (s.state === 'error') {
-            setPct('Parse error');
-          }
-        });
-      });
+      // Belt-and-suspenders: if the upload-side load event does fire,
+      // flip immediately rather than waiting for the parse poll.
+      xhr.upload.addEventListener('load', flipToParsing);
       xhr.addEventListener('load', () => {
         if (xhr.status >= 200 && xhr.status < 300) resolve();
         else reject(new Error(xhr.responseText || `HTTP ${xhr.status}`));
@@ -4584,6 +4700,30 @@ async function uploadLog(file) {
       xhr.addEventListener('error', () => reject(new Error('Network error during upload')));
       xhr.addEventListener('abort', () => reject(new Error('Upload aborted')));
       xhr.send(file);
+
+      // Start polling parse-status now. The poller flips the UI as soon
+      // as the server reports 'parsing' state — this is the reliable
+      // signal that the upload bytes have landed and parsing began.
+      stopPoll = startParsePoll(s => {
+        if (s.state === 'parsing') {
+          flipToParsing();
+          if (phase === 'parse') {
+            setBar(s.pct);
+            const note = (s.total_bytes > 0)
+              ? `${fmtMB(s.bytes_read)} / ${fmtMB(s.total_bytes)} · ${s.pct.toFixed(1)}%`
+              : `${s.pct.toFixed(1)}%`;
+            setPct(note);
+          }
+        } else if (s.state === 'done' && phase === 'parse') {
+          // Parse finished but the response hasn't landed yet (server
+          // is still serializing/sending JSON). Show 100% so the bar
+          // doesn't sit at the last polled value.
+          setBar(100);
+          setPct('Finalizing…');
+        } else if (s.state === 'error') {
+          setPct('Parse error');
+        }
+      });
     });
 
     if (stopPoll) { stopPoll(); stopPoll = null; }
