@@ -605,6 +605,36 @@ pattern, think about ordering.
       column to match the (taller) charts column, leaving the table's
       panel BG ending mid-content.
 
+### Tanking views (analyzer + server + UI)
+- [x] Defender-perspective accounting: `DefenseStats` per `(attacker,
+      defender)` pair tracked in `FightResult.defends_by_pair`.
+      Populated in lockstep with `AttackerStats` inside `_FightBuilder`
+      (no second event walk needed). `merge_encounter` sums across
+      member fights; `apply_pet_owners` remaps the attacker side keys.
+- [x] Encounter detail Tanking tab — third tab next to Damage / Healing.
+      Friendlies sorted by damage taken with parry / block / dodge /
+      rune / invuln / miss / riposte counts and avoid %. Each row
+      expands into a per-attacker breakdown with the same columns and a
+      synthesized "All" row at the top. Click any row to pop a DTPS-
+      over-time modal — same windowing/source-filter machinery as the
+      Damage tab, just keyed by `(attacker, defender)`.
+- [x] Session-summary Damage / Healing / Tanking tabs. The session
+      payload returns three parallel rollups (`damage_actors`,
+      `healing_actors`, `tanking_actors`) sharing a common shape; a
+      generic `_build_session_actor_rollup` helper plugs different
+      per-encounter value-getters into the same averaging/p95/sort
+      logic. Side classification computed once at the session level
+      so an actor stays on the same side across tabs.
+- [x] Damage / Healing / Δ Life metric toggle on tanking surfaces.
+      Switches the session-summary chart + heatmap and the per-defender
+      All-row pair modal between damage taken, healing received, and
+      life delta (heals − damage per bucket). Delta renders as a filled
+      area dipping below zero on charts; the heatmap colors positive
+      blue and negative red. The toggle only appears on the modal's
+      All row — heals aren't keyed by attacker, so per-attacker rows
+      stay damage-only. Delta mode in the modal hides the by-source
+      breakdown and skips the click-to-window UX (no individual events).
+
 ### Sidecar / user overrides (`flurry/sidecar.py`)
 - [x] `<logfile>.flurry.json` next to each log holds two kinds of edits:
       pet-owner assignments (`{actor: owner}`) and manual encounter
