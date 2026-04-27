@@ -162,6 +162,65 @@ line and is parsed as a normal MeleeHit. The MELEE_MISS_*_RE patterns
 include a riposte tail; the riposting party's name isn't captured (the
 hit line attributes the counter-damage on its own).
 
+### Avoidance comes in seven flavors, only one is "miss"
+
+EQ writes a missed swing with a tail clause that names *how* the swing
+failed. The MELEE_MISS patterns capture the whole tail and
+`_classify_miss_tail` maps it to one of seven `outcome` labels on the
+`MeleeMiss` event:
+
+- `miss`         — `but miss(es)!` / `but fail(s)!`
+- `riposte`      — `but Y ripostes!` / `but YOU riposte!`
+- `parry`        — `but Y parries!` / `but YOU parry!`
+- `block`        — `but Y blocks!` / `but YOU block!` /
+                   `but Y blocks with her shield!` (the "with X
+                   shield/staff/..." suffix is observed only on block,
+                   never on parry/dodge)
+- `dodge`        — `but Y dodges!` / `but YOU dodge!`
+- `rune`         — `but Y's magical skin absorbs the blow!` /
+                   `but YOUR magical skin absorbs the blow!` (rune buff
+                   absorbed the hit)
+- `invulnerable` — `but Y is INVULNERABLE!` / `but YOU are INVULNERABLE!`
+                   (god mode / divine aura)
+
+First-person avoider uses bare verbs (`YOU dodge!`), third-person uses
+`-s/-ies` (`Soloson dodges!`, `Soloson parries!`). The avoider is always
+also the line's `target` — no separate avoider field is needed.
+
+Spell resists are a related-but-separate event (`SpellResist`):
+`<target> resisted your <spell>!`. Only the first-person form exists in
+EQ logs — the log filters to your perspective, so other players' resists
+never appear. Caster is hardcoded `'You'`.
+
+### Body-start NAME accepts lowercase articles; mid-line NAME does not
+
+`NAME` requires a capital letter so it doesn't slurp common English
+words mid-sentence. But mob spell-damage lines start with lowercase:
+`a shadowstone grabber hit Robbinwuud for N points by Spell.`. EQ does
+*not* capitalize the article when the mob name leads a line.
+
+`BODY_NAME` is a relaxed variant (`[A-Za-z]` start) used at body-start
+positions: `SPELL_DAMAGE`, `MELEE_HIT_3RD`, `MELEE_MISS_3RD`, `DOT_DAMAGE`
+target, `HEAL_RE` healer, `HEAL_PASSIVE` target, `SPELL_RESIST` target.
+Mid-line uses (`by NAME` clauses, damage shield attacker) keep the strict
+`NAME` to avoid grabbing prepositions.
+
+### Hyphens are valid inside NAME
+
+Boss-tier names like `Cazic-Thule` and `Terris-Thule` use a hyphen.
+The NAME char class is `[\w'`-]` (note the trailing `-`, which is
+literal at the end of a character class) so these parse as a single
+attacker/target, not as `Cazic` truncated at the dash.
+
+### EQ injects double spaces between melee tokens, sometimes
+
+A small fraction of melee lines have an extra space between subject
+and verb (`A Valorian Sentry  tries to punch ...`) or verb and target
+(`Redfreddy slashes  Sigismond Windwalker for ...`). The MELEE_HIT and
+MELEE_MISS patterns use `[ ]+` rather than literal ` ` at every token
+join so these still parse. Specific to combat patterns — other regexes
+were unaffected in observed logs.
+
 ### Greedy NAME + multi-form verbs is a recurring trap
 
 `NAME = r"[A-Z][\w'`]*(?:[ '`][\w'`]+)*"` is intentionally loose so it
@@ -230,6 +289,29 @@ pattern, think about ordering.
 - [x] Pet attribution via backtick names
 - [x] Tested against real raid log: 322,252,497 damage on Shei Vinitras
       attributed correctly across 7 attackers including 2 pets
+- [x] Damage avoidance and resists. `MeleeMiss.outcome` is one of
+      `miss | riposte | parry | block | dodge | rune | invulnerable`
+      and a new `SpellResist` event covers `<target> resisted your
+      <spell>!`. Combat-line coverage validated at 99%+ across six
+      real logs (Hacral, Erebseth, Lyricil, Merkkava, Roobius, Treefer).
+      Same pass added two missing melee verbs (`rend`/`stab`), hyphen
+      support in NAME (`Cazic-Thule`), `BODY_NAME` for lowercase-article
+      mob names (`a shadowstone grabber hit ...`), and `[ ]+` tolerance
+      for EQ's stray double-spaces between melee tokens.
+- [x] First-person bare non-melee (`You were hit by non-melee for N
+      damage.`) routes to `attacker='(unattributed)'`. EQ literally
+      writes `non-melee` as the source, so no further attribution is
+      possible — this just lifts the damage out of UnknownEvent so it
+      reaches damage-taken views.
+- [x] Falling damage parser (`You take N points of falling damage.`)
+      routes to `attacker='(falling)'`, `damage_type='falling'`. **The
+      pattern is UNVERIFIED** — none of our six fixture logs contain a
+      single fall-damage event, so the regex is from community memory
+      rather than direct observation. Motivation: a tank thrown off a
+      platform during a boss mechanic should show up labeled rather
+      than collapsing into the generic non-melee bucket. If a real
+      fall-damage line appears with a different shape, replace the
+      regex AND `test_falling_damage_speculative_format`.
 
 ### Analyzer (analyzer.py)
 - [x] `analyze_fight(logfile, target)` -> `FightResult`

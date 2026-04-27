@@ -49,15 +49,31 @@ class MeleeHit(Event):
 
 @dataclass
 class MeleeMiss(Event):
-    """A melee swing that missed.
+    """A melee swing that produced no damage.
 
-    Examples:
-      'You try to slash Shei Vinitras, but miss!'
-      'Soloson tries to slash Shei Vinitras, but misses!'
+    The `outcome` field distinguishes how the swing was nullified — the
+    attacker simply missed, or the target avoided/absorbed it. EQ writes
+    each form with a distinct tail clause:
+
+      'You try to slash Shei, but miss!'                          -> miss
+      'Soloson tries to slash Shei, but misses!'                  -> miss
+      'X tries to hit Y, but Y ripostes!'                         -> riposte
+      'X tries to hit Y, but Y parries!' / 'YOU parry!'           -> parry
+      'X tries to hit Y, but Y blocks!' / 'YOU block!'            -> block
+      'X tries to hit Y, but Y dodges!' / 'YOU dodge!'            -> dodge
+      "X tries to hit Y, but Y's magical skin absorbs the blow!"  -> rune
+      'X tries to hit YOU, but YOUR magical skin absorbs the blow!' -> rune
+      'X tries to bite Y, but Y is INVULNERABLE!'                 -> invulnerable
+      'X tries to bash YOU, but YOU are INVULNERABLE!'            -> invulnerable
+
+    `target` is the name being attacked (and, for everything except plain
+    miss/fail, also the avoider). The classifier in parser.py picks the
+    outcome from the captured tail text.
     """
     attacker: str
     verb: str
     target: str
+    outcome: str = 'miss'
     modifiers: List[str] = field(default_factory=list)
 
 
@@ -97,6 +113,23 @@ class DeathMessage(Event):
     victim: str
     killer: Optional[str]
     you_died: bool
+
+
+@dataclass
+class SpellResist(Event):
+    """A spell that was fully resisted — the cast landed, no damage applied.
+
+    Example:
+      'Shei Vinitras resisted your Hammer of Magic!'
+
+    Only the first-person form ('resisted your <spell>') appears in EQ
+    logs — the log is filtered to the player's perspective, so other
+    players' resists never surface. We hardcode `caster='You'` to keep
+    the shape parallel to other events.
+    """
+    caster: str
+    target: str
+    spell: str
 
 
 # ----- Healing events -----

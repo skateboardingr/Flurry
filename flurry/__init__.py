@@ -54,6 +54,7 @@ from .events import (
     MeleeHit,
     MeleeMiss,
     SpellDamage,
+    SpellResist,
     HealEvent,
     DeathMessage,
     ZoneEntered,
@@ -72,8 +73,8 @@ __all__ = [
     'Hit', 'Heal', 'Timeline',
     'DEFAULT_SPECIAL_MODS', 'is_crit', 'extract_specials',
     # events
-    'Event', 'MeleeHit', 'MeleeMiss', 'SpellDamage', 'HealEvent',
-    'DeathMessage', 'ZoneEntered', 'UnknownEvent',
+    'Event', 'MeleeHit', 'MeleeMiss', 'SpellDamage', 'SpellResist',
+    'HealEvent', 'DeathMessage', 'ZoneEntered', 'UnknownEvent',
     # parser & tail
     'parse_line', 'tail_file',
     # sidecar

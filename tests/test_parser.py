@@ -13,8 +13,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flurry import (
-    parse_line, MeleeHit, MeleeMiss, SpellDamage, DeathMessage, ZoneEntered,
-    HealEvent,
+    parse_line, MeleeHit, MeleeMiss, SpellDamage, SpellResist, DeathMessage,
+    ZoneEntered, HealEvent,
 )
 
 
@@ -69,6 +69,7 @@ def test_first_person_miss():
     ev = parse_line(line)
     assert isinstance(ev, MeleeMiss), f'expected MeleeMiss, got {type(ev).__name__}'
     assert_eq(ev.attacker, 'You')
+    assert_eq(ev.outcome, 'miss')
 
 
 def test_third_person_miss():
@@ -76,6 +77,7 @@ def test_third_person_miss():
     ev = parse_line(line)
     assert isinstance(ev, MeleeMiss)
     assert_eq(ev.attacker, 'Soloson')
+    assert_eq(ev.outcome, 'miss')
 
 
 def test_riposte_miss_third_person():
@@ -87,6 +89,7 @@ def test_riposte_miss_third_person():
     assert isinstance(ev, MeleeMiss), f'expected MeleeMiss, got {type(ev).__name__}'
     assert_eq(ev.attacker, 'Keltakun, Last Word', 'comma-titled name should parse')
     assert_eq(ev.target, 'Soloson')
+    assert_eq(ev.outcome, 'riposte')
     assert 'Strikethrough' in ev.modifiers
 
 
@@ -96,6 +99,220 @@ def test_riposte_miss_first_person_target():
     ev = parse_line(line)
     assert isinstance(ev, MeleeMiss)
     assert_eq(ev.attacker, 'Rector of the Skies')
+    assert_eq(ev.outcome, 'riposte')
+
+
+# ----- Avoidance: parry / block / dodge / rune / invulnerable -----
+
+def test_parry_third_person_avoider():
+    """'X tries to hit Y, but Y parries!' — 3rd-person avoidance with -ies."""
+    line = '[Sat Apr 25 12:21:28 2026] Shei Vinitras tries to hit Soloson, but Soloson parries! (Flurry)'
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeMiss), f'expected MeleeMiss, got {type(ev).__name__}'
+    assert_eq(ev.attacker, 'Shei Vinitras')
+    assert_eq(ev.target, 'Soloson')
+    assert_eq(ev.outcome, 'parry')
+    assert 'Flurry' in ev.modifiers
+
+
+def test_parry_first_person_avoider():
+    """'X tries to hit YOU, but YOU parry!' — 1st-person uses bare 'parry'."""
+    line = '[Sat Apr 25 12:21:50 2026] Shei Vinitras tries to hit YOU, but YOU parry! (Rampage)'
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeMiss)
+    assert_eq(ev.target, 'YOU')
+    assert_eq(ev.outcome, 'parry')
+    assert 'Rampage' in ev.modifiers
+
+
+def test_block_third_person_avoider():
+    line = '[Mon Jun 16 22:53:28 2025] A water elemental invader tries to hit Utishulla, but Utishulla blocks!'
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeMiss)
+    assert_eq(ev.attacker, 'A water elemental invader')
+    assert_eq(ev.target, 'Utishulla')
+    assert_eq(ev.outcome, 'block')
+
+
+def test_block_with_shield_suffix():
+    """'X blocks with her shield!' — extended block form. Pronoun and item
+    word vary (her/his/its + shield/staff/...). Should still classify as block."""
+    line = '[Sat Apr 25 14:18:13 2026] A gilded guardian tries to bite Tira, but Tira blocks with her shield!'
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeMiss)
+    assert_eq(ev.target, 'Tira')
+    assert_eq(ev.outcome, 'block')
+
+
+def test_block_with_staff_suffix_and_modifier():
+    """Block-with suffix + trailing modifier paren."""
+    line = '[Mon Apr 14 20:21:47 2025] Halgoz Rellinic tries to hit Vikolas, but Vikolas blocks with his shield! (Rampage)'
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeMiss)
+    assert_eq(ev.outcome, 'block')
+    assert 'Rampage' in ev.modifiers
+
+
+def test_dodge_third_person_avoider_lowercase_article():
+    """Mob avoider mid-sentence uses lowercase article ('a Solusek...')."""
+    line = "[Tue Mar 31 10:40:17 2026] Sweetlysingin`s pet tries to slash a Solusek foot soldier, but a Solusek foot soldier dodges!"
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeMiss)
+    assert_eq(ev.attacker, 'Sweetlysingin`s pet')
+    assert_eq(ev.target, 'a Solusek foot soldier')
+    assert_eq(ev.outcome, 'dodge')
+
+
+def test_dodge_first_person_avoider():
+    """'X tries to ... YOU, but YOU dodge!' — bare verb for 1st-person."""
+    line = '[Wed Apr 16 19:20:06 2025] A Stone Abomination tries to smash YOU, but YOU dodge!'
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeMiss)
+    assert_eq(ev.target, 'YOU')
+    assert_eq(ev.outcome, 'dodge')
+
+
+def test_rune_third_person_absorb():
+    """'X tries to hit Y, but Y's magical skin absorbs the blow!' — rune."""
+    line = "[Mon Apr 14 19:50:27 2025] The Fabled Grummus tries to hit Vikolas, but Vikolas's magical skin absorbs the blow!"
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeMiss), f'expected MeleeMiss, got {type(ev).__name__}'
+    assert_eq(ev.attacker, 'The Fabled Grummus')
+    assert_eq(ev.target, 'Vikolas')
+    assert_eq(ev.outcome, 'rune')
+
+
+def test_rune_first_person_absorb():
+    """'X tries to hit YOU, but YOUR magical skin absorbs the blow!' — 1st-person rune."""
+    line = '[Sat Apr 25 12:21:37 2026] Shei Vinitras tries to hit YOU, but YOUR magical skin absorbs the blow! (Riposte Strikethrough Rampage)'
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeMiss)
+    assert_eq(ev.target, 'YOU')
+    assert_eq(ev.outcome, 'rune')
+    # Multi-keyword paren stays as one entry — _strip_modifiers doesn't
+    # split inside the parens, the analyzer does that on demand.
+    assert ev.modifiers == ['Riposte Strikethrough Rampage'], f'got {ev.modifiers!r}'
+
+
+def test_invulnerable_third_person_target():
+    """'X tries to bite Y, but Y is INVULNERABLE!' — divine aura / god mode."""
+    line = '[Sat Apr 25 14:56:40 2026] An acolyte tries to bite Tira, but Tira is INVULNERABLE! (Strikethrough)'
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeMiss)
+    assert_eq(ev.target, 'Tira')
+    assert_eq(ev.outcome, 'invulnerable')
+
+
+def test_invulnerable_first_person_target():
+    """'X tries to bash YOU, but YOU are INVULNERABLE!' — 1st-person form."""
+    line = '[Sat Apr 25 14:56:41 2026] An acolyte tries to bash YOU, but YOU are INVULNERABLE! (Riposte Strikethrough)'
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeMiss)
+    assert_eq(ev.target, 'YOU')
+    assert_eq(ev.outcome, 'invulnerable')
+
+
+# ----- Spell resists -----
+
+def test_spell_resist():
+    """'<target> resisted your <spell>!' — only first-person form exists."""
+    line = '[Sat Apr 25 12:21:20 2026] Shei Vinitras resisted your Hammer of Magic!'
+    ev = parse_line(line)
+    assert isinstance(ev, SpellResist), f'expected SpellResist, got {type(ev).__name__}'
+    assert_eq(ev.caster, 'You')
+    assert_eq(ev.target, 'Shei Vinitras')
+    assert_eq(ev.spell, 'Hammer of Magic')
+
+
+def test_spell_resist_lowercase_article_target():
+    """Mob targets resist too, e.g. 'A Stone Abomination resisted your ...'."""
+    line = '[Wed Apr 16 19:20:03 2025] A Stone Abomination resisted your Bliss of the Nihil!'
+    ev = parse_line(line)
+    assert isinstance(ev, SpellResist)
+    assert_eq(ev.target, 'A Stone Abomination')
+    assert_eq(ev.spell, 'Bliss of the Nihil')
+
+
+def test_spell_resist_with_apostrophe_in_spell_name():
+    """Spell names can contain apostrophes (e.g. 'Rimeclaw's Assonant Binding')."""
+    line = "[Fri Apr 18 01:18:06 2025] An inferno mephit resisted your Rimeclaw's Assonant Binding!"
+    ev = parse_line(line)
+    assert isinstance(ev, SpellResist)
+    assert_eq(ev.target, 'An inferno mephit')
+    assert_eq(ev.spell, "Rimeclaw's Assonant Binding")
+
+
+def test_hit_with_new_verb_rend():
+    """`rend` / `rends` are valid melee verbs (some mob attack types)."""
+    line = '[Fri Apr 18 01:58:37 2025] An astral barnacle rends Roobius for 12970 points of damage. (Riposte Strikethrough)'
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeHit), f'expected MeleeHit, got {type(ev).__name__}'
+    assert_eq(ev.attacker, 'An astral barnacle')
+    assert_eq(ev.verb, 'rends')
+    assert_eq(ev.damage, 12970)
+
+
+def test_miss_with_new_verb_rend():
+    """`tries to rend` should classify as a normal miss."""
+    line = '[Mon Jun 30 19:43:50 2025] An arisen spectre tries to rend Soloson, but Soloson ripostes!'
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeMiss), f'expected MeleeMiss, got {type(ev).__name__}'
+    assert_eq(ev.verb, 'rend')
+    assert_eq(ev.outcome, 'riposte')
+
+
+def test_hit_with_new_verb_stab():
+    """`stab` / `stabs` (rogue-style verb) — appears as a melee hit verb."""
+    line = '[Wed Jul 23 21:00:17 2025] Zun`Muram Votal stabs Frostyman for 930 points of damage.'
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeHit), f'expected MeleeHit, got {type(ev).__name__}'
+    assert_eq(ev.attacker, 'Zun`Muram Votal')
+    assert_eq(ev.verb, 'stabs')
+    assert_eq(ev.target, 'Frostyman')
+    assert_eq(ev.damage, 930)
+
+
+def test_hyphenated_attacker_name():
+    """Names with hyphens like 'Cazic-Thule' must parse as one NAME, not
+    truncate at the dash. Real raid-boss names use this form."""
+    line = '[Wed Jul 23 21:00:17 2025] Cazic-Thule hit Hammerbeard for 254 points of poison damage by Greenmist Touch.'
+    ev = parse_line(line)
+    assert isinstance(ev, SpellDamage), f'expected SpellDamage, got {type(ev).__name__}'
+    assert_eq(ev.attacker, 'Cazic-Thule')
+    assert_eq(ev.target, 'Hammerbeard')
+    assert_eq(ev.damage, 254)
+
+
+def test_hyphenated_attacker_in_miss():
+    """Hyphenated NAME on the attacker side of a miss line."""
+    line = '[Wed Jul 23 21:00:17 2025] Terris-Thule tries to hit Vikolas, but Vikolas dodges!'
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeMiss), f'expected MeleeMiss, got {type(ev).__name__}'
+    assert_eq(ev.attacker, 'Terris-Thule')
+    assert_eq(ev.target, 'Vikolas')
+    assert_eq(ev.outcome, 'dodge')
+
+
+def test_double_space_subject_to_verb_in_miss():
+    """EQ occasionally injects a double space between the subject and the
+    verb keyword (observed for `A Valorian Sentry  ` in real logs).
+    Tolerate `[ ]+` rather than rejecting the line."""
+    line = '[Wed May 21 19:57:55 2025] A Valorian Sentry  tries to punch Rimcaster, but misses!'
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeMiss), f'expected MeleeMiss, got {type(ev).__name__}'
+    assert_eq(ev.attacker, 'A Valorian Sentry')
+    assert_eq(ev.outcome, 'miss')
+
+
+def test_double_space_verb_to_target_in_hit():
+    """Same EQ quirk between the verb and the target name."""
+    line = '[Wed May 21 19:57:55 2025] Redfreddy slashes  Sigismond Windwalker for 245 points of damage. (Riposte)'
+    ev = parse_line(line)
+    assert isinstance(ev, MeleeHit), f'expected MeleeHit, got {type(ev).__name__}'
+    assert_eq(ev.attacker, 'Redfreddy')
+    assert_eq(ev.target, 'Sigismond Windwalker')
+    assert_eq(ev.damage, 245)
+    assert 'Riposte' in ev.modifiers
 
 
 def test_comma_titled_name_in_hit():
@@ -146,6 +363,19 @@ def test_spell_damage_third_person_bare_hit():
     assert_eq(ev.spell, 'Flamebrand VII')
 
 
+def test_spell_damage_lowercase_article_attacker():
+    """Mob spell-damage lines start with lowercase article ('a foo hit X
+    for N points by Spell.'). The body-start NAME variant accepts these."""
+    line = '[Wed Jul 23 21:00:17 2025] a shadowstone grabber hit Robbinwuud for 173424 points of unresistable damage by Fracturing Stomp.'
+    ev = parse_line(line)
+    assert isinstance(ev, SpellDamage), f'expected SpellDamage, got {type(ev).__name__}'
+    assert_eq(ev.attacker, 'a shadowstone grabber')
+    assert_eq(ev.target, 'Robbinwuud')
+    assert_eq(ev.damage, 173424)
+    assert_eq(ev.damage_type, 'unresistable')
+    assert_eq(ev.spell, 'Fracturing Stomp')
+
+
 def test_dot_damage_first_person_target():
     """DoT format: 'You have taken N damage from SPELL by ATTACKER.'"""
     line = '[Sat Apr 25 12:21:18 2026] You have taken 152563 damage from Gouging Strike by Feather Silver Sheen.'
@@ -166,6 +396,35 @@ def test_dot_damage_third_person_target():
     assert_eq(ev.target, 'Robbinwuud')
     assert_eq(ev.attacker, 'Feather Silver Sheen')
     assert_eq(ev.damage, 160717)
+
+
+def test_falling_damage_speculative_format():
+    """UNVERIFIED format — see FALLING_DAMAGE_RE. None of the fixture
+    logs contain real fall damage; this asserts the speculative pattern
+    parses cleanly. If a real EQ fall-damage line appears with a
+    different shape, update both the regex and this test."""
+    line = '[Sat Apr 25 13:00:00 2026] You take 250 points of falling damage.'
+    ev = parse_line(line)
+    assert isinstance(ev, SpellDamage), f'expected SpellDamage, got {type(ev).__name__}'
+    assert_eq(ev.attacker, '(falling)')
+    assert_eq(ev.target, 'You')
+    assert_eq(ev.damage, 250)
+    assert_eq(ev.damage_type, 'falling')
+
+
+def test_you_were_hit_by_non_melee():
+    """'You were hit by non-melee for N damage.' — EQ doesn't name a
+    source for these (literal 'non-melee' is the source descriptor).
+    Routed to '(unattributed)' attacker so the damage still reaches
+    damage-taken views."""
+    line = '[Wed May 21 19:40:08 2025] You were hit by non-melee for 10 damage.'
+    ev = parse_line(line)
+    assert isinstance(ev, SpellDamage), f'expected SpellDamage, got {type(ev).__name__}'
+    assert_eq(ev.attacker, '(unattributed)')
+    assert_eq(ev.target, 'You')
+    assert_eq(ev.damage, 10)
+    assert_eq(ev.damage_type, 'non-melee')
+    assert ev.spell is None
 
 
 def test_damage_shield():

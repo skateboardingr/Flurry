@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Optional, List, Tuple, Callable
 
 from .events import (
-    Event, MeleeHit, MeleeMiss, SpellDamage, DeathMessage,
+    Event, MeleeHit, MeleeMiss, SpellDamage, SpellResist, DeathMessage,
     HealEvent, ZoneEntered, UnknownEvent,
 )
 
@@ -51,20 +51,29 @@ def parse_timestamp(ts_str: str) -> datetime:
 # both their own attacks (first-person) and other players' (third-person).
 MELEE_VERBS_HIT_3RD = (
     r'(?:slashes|crushes|punches|pierces|claws|kicks|bites|hits|gores|strikes|'
-    r'mauls|smashes|stings|backstabs|frenzies on|maims|slices|bashes|shoots)'
+    r'mauls|smashes|stings|backstabs|frenzies on|maims|slices|bashes|shoots|'
+    r'rends|stabs)'
 )
 MELEE_VERBS_HIT_1ST = (
     r'(?:slash|crush|punch|pierce|claw|kick|bite|hit|gore|strike|maul|smash|'
-    r'sting|backstab|frenzy on|maim|slice|bash|shoot)'
+    r'sting|backstab|frenzy on|maim|slice|bash|shoot|rend|stab)'
 )
 MELEE_VERBS_MISS = MELEE_VERBS_HIT_1ST  # 'tries to slash' uses bare form
 
 # Name pattern that allows pets (e.g. 'Soloson`s pet' - note BACKTICK,
 # not apostrophe - that's an EQ quirk going back forever), possessives,
-# and comma-titles like 'Keltakun, Last Word' (mob with epithet).
-# The separator alternation is `[ '`]` for word breaks and `, ` for the
-# title-comma case.
-NAME = r"[A-Z][\w'`]*(?:(?:[ '`]|, )[\w'`]+)*"
+# comma-titles like 'Keltakun, Last Word' (mob with epithet), and hyphens
+# in proper nouns (e.g. 'Cazic-Thule', 'Terris-Thule'). The separator
+# alternation is `[ '`]` for word breaks and `, ` for the title-comma case.
+NAME = r"[A-Z][\w'`-]*(?:(?:[ '`]|, )[\w'`-]+)*"
+
+# Variant that also accepts a lowercase first letter, used at body-start
+# positions where EQ writes mob names with lowercase articles ('a Solusek
+# mage hit X for N points by Spell.', 'an astral barnacle ...'). Keeping
+# this separate from NAME means mid-line NAME usage (after `by`, in heal
+# clauses, etc.) keeps the strict capital-start guard against slurping
+# common English words from neighboring text.
+BODY_NAME = r"[A-Za-z][\w'`-]*(?:(?:[ '`]|, )[\w'`-]+)*"
 
 
 # --- Spell damage: 'X hit Y for N points of TYPE damage by SPELL.' ---
@@ -78,7 +87,7 @@ NAME = r"[A-Z][\w'`]*(?:(?:[ '`]|, )[\w'`]+)*"
 # would-be attacker can't backtrack into a working configuration because
 # the only target text available starts with 'by '.
 SPELL_DAMAGE_RE = re.compile(
-    rf'^(?P<attacker>You|{NAME}) hit (?P<target>(?!by )[^.]+?) '
+    rf'^(?P<attacker>You|{BODY_NAME}) hit (?P<target>(?!by )[^.]+?) '
     rf'for (?P<dmg>\d+) points? of (?P<dtype>[\w-]+) damage '
     rf'by (?P<spell>[^.]+?)\.(?P<rest>.*)$'
 )
@@ -102,6 +111,26 @@ NONMELEE_DAMAGE_RE = re.compile(
     r'for (?P<dmg>\d+) points? of non-melee damage\.(?P<rest>.*)$'
 )
 
+# --- First-person bare non-melee: 'You were hit by non-melee for N damage.' ---
+# A passive form with no source named — EQ literally writes 'non-melee' as
+# the source descriptor, so there's nothing further to attribute. Routed
+# to '(unattributed)' so it still flows into damage-taken views.
+YOU_NONMELEE_RE = re.compile(
+    r'^You were hit by non-melee for (?P<dmg>\d+) damage\.(?P<rest>.*)$'
+)
+
+# --- Falling damage: 'You take N points of falling damage.' ---
+# UNVERIFIED — none of our six fixture logs contain a single fall-damage
+# event, so this format is from community memory rather than direct
+# observation. If you encounter a real fall-damage line and the format
+# differs, replace this regex with the actual one. Tagged with attacker
+# '(falling)' (separate sentinel from '(unattributed)') so a tank flying
+# off a platform during a boss mechanic shows up labeled rather than
+# disappearing into the generic non-melee bucket.
+FALLING_DAMAGE_RE = re.compile(
+    r'^You take (?P<dmg>\d+) points? of falling damage\.(?P<rest>.*)$'
+)
+
 # --- DoT damage: 'X has/have taken N damage from SPELL by Y.' ---
 # Modern EQ writes DoT ticks in this passive form with the source named
 # *after* `by`. Matches:
@@ -110,13 +139,18 @@ NONMELEE_DAMAGE_RE = re.compile(
 # 'has' for third-person targets, 'have' for first-person (You). No
 # damage type word in this format — we tag it as 'dot' for the type.
 DOT_DAMAGE_RE = re.compile(
-    rf'^(?P<target>You|{NAME}) (?:has|have) taken (?P<dmg>\d+) damage '
+    rf'^(?P<target>You|{BODY_NAME}) (?:has|have) taken (?P<dmg>\d+) damage '
     rf'from (?P<spell>.+?) by (?P<attacker>You|{NAME})\.(?P<rest>.*)$'
 )
 
 # --- Third-person melee: 'X slashes Y for N points of damage.' ---
+# Spaces are written as `[ ]+` (one or more) because EQ occasionally
+# injects an extra space between tokens — observed forms include
+# 'Redfreddy slashes  Sigismond Windwalker' (verb→target gap doubled)
+# and 'A Valorian Sentry  punches Rimcaster' (subject→verb doubled).
+# We tolerate the variation rather than reject those lines.
 MELEE_HIT_3RD_RE = re.compile(
-    rf'^(?P<attacker>{NAME}) (?P<verb>{MELEE_VERBS_HIT_3RD}) (?P<target>.+?) '
+    rf'^(?P<attacker>{BODY_NAME})[ ]+(?P<verb>{MELEE_VERBS_HIT_3RD})[ ]+(?P<target>.+?)[ ]+'
     rf'for (?P<dmg>\d+) points? of damage\.(?P<rest>.*)$'
 )
 
@@ -124,25 +158,56 @@ MELEE_HIT_3RD_RE = re.compile(
 # Note: bare verb (no -s/-es). 'You hit X for N points of damage' (no spell)
 # is also caught here.
 MELEE_HIT_1ST_RE = re.compile(
-    rf'^(?P<attacker>You) (?P<verb>{MELEE_VERBS_HIT_1ST}) (?P<target>.+?) '
+    rf'^(?P<attacker>You)[ ]+(?P<verb>{MELEE_VERBS_HIT_1ST})[ ]+(?P<target>.+?)[ ]+'
     rf'for (?P<dmg>\d+) points? of damage\.(?P<rest>.*)$'
 )
 
+# --- Miss / avoidance tail ---
+# A successful avoidance line ends in one of these clauses. Used by both
+# the 1st- and 3rd-person miss patterns below. We capture the whole tail
+# in one named group and let `_classify_miss_tail` pick the outcome word
+# in Python — keeps the regex readable and one place to extend.
+#
+# Avoider names in the tail can be lowercase-articled mid-sentence (e.g.
+# 'a Solusek foot soldier dodges!'), so we use `[^!]+?` rather than NAME.
+# Each branch ends with `!` so the lazy quantifier is self-bounded.
+#
+# Branches:
+#   miss(es)! / fail(s)!                    — pure miss/fail
+#   <name> ripostes? !                      — riposte (1st: 'YOU riposte!')
+#   <name> dodges?|parr(y|ies)|blocks? !    — avoidance (1st: bare verb)
+#   <name>['s|R] magical skin absorbs the blow! — rune (1st: 'YOUR ...')
+#   <name> (is|are) INVULNERABLE!           — divine aura / god mode
+_MISS_TAIL = (
+    r'(?:miss(?:es)?!|fail(?:s)?!'
+    r'|[^!]+? ripostes?!'
+    # Block has an optional ' with <his/her/its> <shield/staff/...>' suffix
+    # ('Tira blocks with her shield!'); dodge and parry never do.
+    r'|[^!]+? (?:dodges?|parr(?:y|ies)|blocks?(?: with [^!]+)?)!'
+    r'|[^!]+? magical skin absorbs the blow!'
+    r'|[^!]+? (?:is|are) INVULNERABLE!)'
+)
+
+
 # --- Third-person miss: 'X tries to slash Y, but misses!' ---
-# Riposte tail handled too: 'X tries to slash Y, but Y ripostes!' (third-
-# person target) and 'X tries to bite YOU, but YOU riposte!' (first-person
-# target uses bare 'riposte', hence the optional `s`). The riposting
-# party's name doesn't need to be captured here — the resulting counter
-# damage shows up as its own MeleeHit line with a (Riposte) modifier.
+# `[ ]+` rather than literal space at token joins, see MELEE_HIT_3RD_RE.
 MELEE_MISS_3RD_RE = re.compile(
-    rf'^(?P<attacker>{NAME}) tries to (?P<verb>{MELEE_VERBS_MISS}) '
-    rf'(?P<target>.+?), but (?:misses!|fails!|[^!]+? ripostes?!)(?P<rest>.*)$'
+    rf'^(?P<attacker>{BODY_NAME})[ ]+tries to[ ]+(?P<verb>{MELEE_VERBS_MISS})[ ]+'
+    rf'(?P<target>.+?), but (?P<tail>{_MISS_TAIL})(?P<rest>.*)$'
 )
 
 # --- First-person miss: 'You try to slash Y, but miss!' ---
 MELEE_MISS_1ST_RE = re.compile(
-    rf'^(?P<attacker>You) try to (?P<verb>{MELEE_VERBS_MISS}) '
-    rf'(?P<target>.+?), but (?:miss!|fail!|[^!]+? ripostes?!)(?P<rest>.*)$'
+    rf'^(?P<attacker>You)[ ]+try to[ ]+(?P<verb>{MELEE_VERBS_MISS})[ ]+'
+    rf'(?P<target>.+?), but (?P<tail>{_MISS_TAIL})(?P<rest>.*)$'
+)
+
+
+# --- Spell resist: 'X resisted your <Spell>!' ---
+# Only first-person form exists in the log (EQ filters to your perspective —
+# you never see other players' targets resist their casts).
+SPELL_RESIST_RE = re.compile(
+    rf'^(?P<target>{BODY_NAME}) resisted your (?P<spell>.+?)!$'
 )
 
 # --- Passive heal: 'X has been healed (over time) by Y for N hit points by SPELL.' ---
@@ -151,7 +216,7 @@ MELEE_MISS_1ST_RE = re.compile(
 # our `NAME` regex is loose enough that it would otherwise greedily slurp
 # 'Lunarya has been' as the healer in 'Lunarya has been healed by ...'.
 HEAL_PASSIVE_RE = re.compile(
-    rf'^(?P<target>You|{NAME}) (?:has been|have been) healed '
+    rf'^(?P<target>You|{BODY_NAME}) (?:has been|have been) healed '
     rf'(?:over time )?by (?P<healer>You|{NAME}) '
     rf'for (?P<amt>\d+)(?:\s+\(\d+\))? hit points?'
     rf'(?: by (?P<spell>[^.]+?))?\.(?P<rest>.*)$'
@@ -165,7 +230,7 @@ HEAL_PASSIVE_RE = re.compile(
 # The 'over time' qualifier marks a HoT tick rather than a direct heal.
 # `by SPELL` is optional because some lines omit it.
 HEAL_RE = re.compile(
-    rf'^(?P<healer>You|{NAME}) (?:has |have )?healed (?P<target>.+?) '
+    rf'^(?P<healer>You|{BODY_NAME}) (?:has |have )?healed (?P<target>.+?) '
     rf'(?:over time )?for (?P<amt>\d+)(?:\s+\(\d+\))? hit points?'
     rf'(?: by (?P<spell>[^.]+?))?\.(?P<rest>.*)$'
 )
@@ -250,6 +315,34 @@ def _build_nonmelee_damage(ts, raw, m):
                        modifiers=[])
 
 
+def _build_you_nonmelee(ts, raw, m):
+    # 'You were hit by non-melee for N damage.' — same convention as the
+    # generic non-melee builder: no source available, attribute to
+    # '(unattributed)' so the damage still reaches damage-taken views.
+    _, modifiers = _strip_modifiers(m.group('rest'))
+    return SpellDamage(timestamp=ts, raw=raw,
+                       attacker='(unattributed)',
+                       target='You',
+                       damage=int(m.group('dmg')),
+                       damage_type='non-melee',
+                       spell=None,
+                       modifiers=modifiers)
+
+
+def _build_falling_damage(ts, raw, m):
+    # See FALLING_DAMAGE_RE — pattern is unverified. Attacker tagged
+    # '(falling)' so a tank thrown off a platform mid-fight shows up
+    # labeled rather than collapsing into '(unattributed)'.
+    _, modifiers = _strip_modifiers(m.group('rest'))
+    return SpellDamage(timestamp=ts, raw=raw,
+                       attacker='(falling)',
+                       target='You',
+                       damage=int(m.group('dmg')),
+                       damage_type='falling',
+                       spell=None,
+                       modifiers=modifiers)
+
+
 def _build_melee_hit(ts, raw, m):
     """Builder for both first- and third-person melee hits.
     Both regex variants name the same groups (attacker, verb, target, dmg, rest)
@@ -263,13 +356,43 @@ def _build_melee_hit(ts, raw, m):
                     modifiers=modifiers)
 
 
+def _classify_miss_tail(tail: str) -> str:
+    """Map a captured miss-tail string to its outcome label.
+
+    Order matters: more-specific markers first. 'magical skin' before
+    'absorb' (single keyword anyway), 'INVULNERABLE' before 'are'/'is',
+    'riposte' before bare 'dodge/parry/block' (no overlap, but kept for
+    clarity)."""
+    if 'magical skin' in tail:
+        return 'rune'
+    if 'INVULNERABLE' in tail:
+        return 'invulnerable'
+    if 'riposte' in tail:
+        return 'riposte'
+    if 'parr' in tail:           # parry / parries
+        return 'parry'
+    if 'block' in tail:
+        return 'block'
+    if 'dodge' in tail:
+        return 'dodge'
+    return 'miss'                # miss / misses / fail / fails
+
+
 def _build_melee_miss(ts, raw, m):
     _, modifiers = _strip_modifiers(m.group('rest'))
     return MeleeMiss(timestamp=ts, raw=raw,
                      attacker=m.group('attacker'),
                      verb=m.group('verb'),
                      target=m.group('target'),
+                     outcome=_classify_miss_tail(m.group('tail')),
                      modifiers=modifiers)
+
+
+def _build_spell_resist(ts, raw, m):
+    return SpellResist(timestamp=ts, raw=raw,
+                       caster='You',
+                       target=m.group('target'),
+                       spell=m.group('spell'))
 
 
 def _build_you_slain(ts, raw, m):
@@ -330,10 +453,13 @@ PATTERNS: List[Tuple[re.Pattern, Callable]] = [
     (DOT_DAMAGE_RE,      _build_dot_damage),
     (DAMAGE_SHIELD_RE,   _build_damage_shield),
     (NONMELEE_DAMAGE_RE, _build_nonmelee_damage),
+    (YOU_NONMELEE_RE,    _build_you_nonmelee),
+    (FALLING_DAMAGE_RE,  _build_falling_damage),
     (MELEE_HIT_1ST_RE,   _build_melee_hit),
     (MELEE_HIT_3RD_RE,   _build_melee_hit),
     (MELEE_MISS_1ST_RE,  _build_melee_miss),
     (MELEE_MISS_3RD_RE,  _build_melee_miss),
+    (SPELL_RESIST_RE,    _build_spell_resist),
     (HEAL_PASSIVE_RE,    _build_heal_passive),
     (HEAL_RE,            _build_heal),
     (YOU_SLAIN_RE,       _build_you_slain),
