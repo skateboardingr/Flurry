@@ -550,6 +550,27 @@ def _session_summary_payload(encounters: List[Encounter],
     tanking_actors = _build_session_actor_rollup(
         encounters, encounter_ids_order, tanking_actors_for, sides)
 
+    # Layer per-encounter healing-received data onto each tanking row so
+    # the front-end's chart toggle can swap between damage taken / healing
+    # received / life delta without a second round-trip. Heals are
+    # attributed to the heal's `target` (the defender being healed).
+    # Life delta is computed client-side as heals_received - damage_taken
+    # per encounter — no need to ship a third array.
+    heals_per_def_enc: dict = {}  # (def_lower, eid) -> total heal amount
+    for e in encounters:
+        for h in e.heals:
+            key = (h.target.lower(), e.encounter_id)
+            heals_per_def_enc[key] = heals_per_def_enc.get(key, 0) + h.amount
+    enc_durations = {e.encounter_id: (e.duration_seconds or 1.0) for e in encounters}
+    for t in tanking_actors:
+        def_lo = t['attacker'].lower()
+        heals_value = [heals_per_def_enc.get((def_lo, eid), 0)
+                       for eid in encounter_ids_order]
+        heals_rate = [round(v / enc_durations[eid])
+                      for v, eid in zip(heals_value, encounter_ids_order)]
+        t['per_encounter_heals_value'] = heals_value
+        t['per_encounter_heals_rate'] = heals_rate
+
     starts = [e.start for e in encounters if e.start]
     ends = [e.end for e in encounters if e.end]
     return {
@@ -1376,6 +1397,33 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
         # better to include them than silently drop the tank from their
         # own tab. Enemies' damage taken is already on the Damage tab's
         # Enemies section.
+        # Per-defender heal series + per-heal records, for the modal's
+        # damage / healing / life-delta toggle on the All row. Bucketed
+        # off the same encounter timeline as the damage matrix so the
+        # life-delta line can be computed client-side as heals - damage.
+        defender_heals: dict = {}  # def_lower -> {'series': [...], 'hits_detail': [...], 'total': N}
+        for h in e.heals:
+            def_lo = h.target.lower()
+            entry = defender_heals.setdefault(def_lo, {
+                'series': [0] * n_buckets,
+                'hits_detail': [],
+                'total': 0,
+            })
+            entry['total'] += h.amount
+            offset = 0
+            if e.start is not None:
+                offset = (h.timestamp - e.start).total_seconds()
+                idx = min(max(0, int(offset / bucket_seconds)), n_buckets - 1)
+                entry['series'][idx] += h.amount
+            entry['hits_detail'].append({
+                'offset_s': int(offset),
+                'damage': h.amount,           # reuse `damage` field so the
+                'mods': list(h.modifiers),    # modal's source breakdown
+                'kind': 'heal',               # works without translation
+                'spell': h.spell,
+                'source': h.healer,
+            })
+
         defenders_map: dict = {}
         for (atk_name, def_name), d in merged.defends_by_pair.items():
             if _is_corpse(atk_name) or _is_corpse(def_name):
@@ -1415,9 +1463,21 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                 'hits_detail': hits_detail,
             })
         defenders = []
-        for rec in defenders_map.values():
+        for def_lo, rec in defenders_map.items():
             rec['breakdown'].sort(key=lambda r: (r['damage_taken'], r['hits_landed']),
                                   reverse=True)
+            # Attach per-defender heals (used by the modal's All-row toggle
+            # to render healing-received and life-delta series). Empty
+            # arrays for defenders with no heals received.
+            heal_entry = defender_heals.get(def_lo)
+            if heal_entry:
+                rec['heals_series'] = heal_entry['series']
+                rec['heals_detail'] = heal_entry['hits_detail']
+                rec['heals_total'] = heal_entry['total']
+            else:
+                rec['heals_series'] = [0] * n_buckets
+                rec['heals_detail'] = []
+                rec['heals_total'] = 0
             defenders.append(rec)
         defenders.sort(key=lambda r: (r['damage_taken'], r['hits_landed']),
                        reverse=True)
@@ -1670,6 +1730,21 @@ _INDEX_HTML = r'''<!DOCTYPE html>
   /* Pair-modal layout: chart + stats + hits on the left, source
      breakdown on the right. Stack the columns when narrow. */
   .modal.pair-modal { max-width: 1100px; }
+  /* Delta mode hides the source-breakdown column; let the chart take
+     the full width. */
+  .modal.pair-modal.no-source-panel .pair-body {
+    grid-template-columns: 1fr;
+  }
+  /* Header row with title + (optional) damage/healing/delta toggle.
+     padding-right on the row itself reserves space for the absolutely-
+     positioned modal-close (×) button so the toggle group doesn't slide
+     under it on narrower viewports. */
+  .pair-modal-head { display: flex; align-items: flex-start;
+                     justify-content: space-between; gap: 16px;
+                     margin-bottom: 4px; padding-right: 36px; }
+  .pair-metric-toggle { display: inline-flex; gap: 0;
+                        border: 1px solid var(--border); border-radius: 6px;
+                        overflow: hidden; flex-shrink: 0; }
   .pair-body { display: grid; grid-template-columns: 1fr 260px;
                gap: 20px; margin-top: 14px; align-items: start; }
   @media (max-width: 800px) { .pair-body { grid-template-columns: 1fr; } }
@@ -1823,6 +1898,24 @@ _INDEX_HTML = r'''<!DOCTYPE html>
                   margin: 0 0 12px; font-weight: 600; }
   .ss-section-h .sub { color: var(--text-dim); font-weight: 400;
                        font-size: 0.85rem; margin-left: 6px; }
+
+  /* Tanking sub-metric toggle (damage / healing / delta), shown beside
+     the chart heading when the Tanking tab is active. */
+  .ss-chart-head { display: flex; align-items: baseline;
+                   justify-content: space-between; gap: 12px;
+                   margin-bottom: 12px; flex-wrap: wrap; }
+  .ss-chart-head .ss-section-h { margin: 0; }
+  .ss-metric-toggle { display: inline-flex; gap: 0;
+                      border: 1px solid var(--border); border-radius: 6px;
+                      overflow: hidden; }
+  .ss-metric-btn { background: transparent; border: 0;
+                   border-right: 1px solid var(--border);
+                   color: var(--text-dim); font-family: inherit;
+                   font-size: 0.8rem; padding: 4px 12px; cursor: pointer; }
+  .ss-metric-btn:last-child { border-right: 0; }
+  .ss-metric-btn:hover { background: var(--row-hover);
+                         color: var(--text-bright); }
+  .ss-metric-btn.active { background: var(--accent); color: #fff; }
 
   /* Rollup table — narrower text, fewer fences so it fits in the right
      column without wrapping the numeric columns. The 8-column table
@@ -2996,6 +3089,13 @@ async function renderEncounter(id) {
       unit: kind.unit,
       amountLabel: kind.pairAmountLabel,
       countLabel: kind.pairCountLabel,
+      // Optional tanking-only extras: when present, the pair modal
+      // shows a damage / healing / delta toggle and switches the chart
+      // series accordingly. Only set on the All-row of a tanking
+      // defender — per-attacker rows have no defender-scoped heal data.
+      heals_series: row.heals_series || null,
+      heals_detail: row.heals_detail || null,
+      heals_total: row.heals_total || 0,
     };
     return id;
   };
@@ -3276,9 +3376,16 @@ async function renderEncounter(id) {
         for (const h of br.hits_detail) allHitsDetail.push(h);
       }
     }
+    // Attach the defender's heals series + per-heal detail so the modal
+    // can toggle between damage taken / healing received / life delta.
+    // Per-attacker breakdown rows don't get this (heals aren't keyed by
+    // attacker), so the toggle only appears on the All row.
     const allPairRow = {
       damage: d.damage_taken, hits: d.hits_landed,
       series: allSeries || [], hits_detail: allHitsDetail,
+      heals_series: d.heals_series || [],
+      heals_detail: d.heals_detail || [],
+      heals_total: d.heals_total || 0,
     };
     const allPairId = registerPair('All', d.defender, allPairRow, KIND_TANKING);
     const allBreakdownRow = `
@@ -3483,8 +3590,36 @@ let sessionSummarySettings = {
                       // long otherwise) — units depend on active mode
   trendTopN: 10,      // chart legend cap; rest collapse into "Other"
   mode: 'damage',     // 'damage' | 'healing' | 'tanking'
+  tankingMetric: 'damage', // tanking sub-toggle: 'damage' | 'healing' | 'delta'
 };
 let sessionSummaryChart = null;
+
+// Tanking sub-toggle for the chart + heatmap. Each metric pulls a
+// different per-encounter array off the actor row (server provides
+// damage and healing arrays; delta is computed client-side).
+const TANK_METRICS = {
+  damage: {
+    label: 'Damage taken', shortLabel: 'Damage',
+    rateLabel: 'DTPS',
+    rateOf: a => a.per_encounter_rate,
+  },
+  healing: {
+    label: 'Healing received', shortLabel: 'Healing',
+    rateLabel: 'HPS in',
+    rateOf: a => a.per_encounter_heals_rate || a.per_encounter_rate.map(() => 0),
+  },
+  delta: {
+    label: 'Life delta', shortLabel: 'Δ Life',
+    rateLabel: 'ΔHP/s',
+    // Healing minus damage taken per encounter — positive = net heal,
+    // negative = net loss. Plotted as a single area dipping below zero.
+    rateOf: a => {
+      const dmg = a.per_encounter_rate || [];
+      const heal = a.per_encounter_heals_rate || dmg.map(() => 0);
+      return dmg.map((d, i) => (heal[i] || 0) - d);
+    },
+  },
+};
 
 async function renderSessionSummary(scopedIds) {
   if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
@@ -3524,6 +3659,14 @@ async function renderSessionSummary(scopedIds) {
   const friendlies = allActors.filter(a => a.side === 'friendly')
                               .filter(a => a.avg_rate >= sessionSummarySettings.minRate);
   const enemies = allActors.filter(a => a.side === 'enemy');
+
+  // Tanking sub-metric (damage taken / healing received / life delta).
+  // Only meaningful when mode === 'tanking'; the helper produces a
+  // per-encounter rate array per actor that the chart and heatmap use.
+  const isTanking = sessionSummarySettings.mode === 'tanking';
+  const tankMetric = TANK_METRICS[sessionSummarySettings.tankingMetric] || TANK_METRICS.damage;
+  const rateLabelForChart = isTanking ? tankMetric.rateLabel : mode.rateLabel;
+  const rateForActor = a => isTanking ? tankMetric.rateOf(a) : a.per_encounter_rate;
 
   if (data.encounter_count === 0) {
     let hint;
@@ -3594,7 +3737,19 @@ async function renderSessionSummary(scopedIds) {
     <div class="ss-grid">
       <div class="ss-charts">
         <div class="panel">
-          <h3 class="ss-section-h">${mode.rateLabel} by encounter <span class="sub">— top ${Math.min(sessionSummarySettings.trendTopN, friendlies.length)}</span></h3>
+          <div class="ss-chart-head">
+            <h3 class="ss-section-h">${rateLabelForChart} by encounter <span class="sub">— top ${Math.min(sessionSummarySettings.trendTopN, friendlies.length)}</span></h3>
+            ${isTanking ? `
+              <div class="ss-metric-toggle">
+                ${['damage', 'healing', 'delta'].map(k => {
+                  const m = TANK_METRICS[k];
+                  const isActive = k === sessionSummarySettings.tankingMetric;
+                  return `<button class="ss-metric-btn ${isActive ? 'active' : ''}"
+                                  data-tank-metric="${k}"
+                                  title="${m.label}">${m.shortLabel}</button>`;
+                }).join('')}
+              </div>` : ''}
+          </div>
           <div class="chart-wrap" style="background: transparent; padding: 0; margin: 0;">
             <canvas id="ss-trend-chart" height="200"></canvas>
           </div>
@@ -3602,7 +3757,7 @@ async function renderSessionSummary(scopedIds) {
         <div class="panel">
           <h3 class="ss-section-h">${mode.actorLabel} × encounter heatmap
             <span class="sub">— click a cell to drill in</span></h3>
-          ${ssHeatmapHTML(friendlies, data.encounters, mode)}
+          ${ssHeatmapHTML(friendlies, data.encounters, mode, isTanking ? tankMetric : null)}
         </div>
       </div>
       <div class="ss-table-col">
@@ -3639,6 +3794,17 @@ async function renderSessionSummary(scopedIds) {
       renderSessionSummary(scopedIds);
     });
   });
+  // Tanking sub-toggle (damage / healing / delta). Re-renders the chart
+  // and heatmap; the rollup table stays on damage-taken stats since the
+  // per-actor aggregates (avg/median/p95) are damage-rooted.
+  app.querySelectorAll('.ss-metric-btn[data-tank-metric]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const m = btn.dataset.tankMetric;
+      if (m === sessionSummarySettings.tankingMetric) return;
+      sessionSummarySettings.tankingMetric = m;
+      renderSessionSummary(scopedIds);
+    });
+  });
 
   // Wire heatmap cell clicks. data-encounter-id navigates to that
   // encounter's detail view — same pattern as the session table.
@@ -3650,25 +3816,37 @@ async function renderSessionSummary(scopedIds) {
 
   // Build the trend chart. Top-N actors get their own line; the rest
   // are summed into an "Other" line so the legend stays readable.
+  // For tanking, the line data comes from the active sub-metric
+  // (damage / healing / delta); for damage and healing tabs it's the
+  // single per_encounter_rate array.
   const topN = sessionSummarySettings.trendTopN;
   const top = friendlies.slice(0, topN);
   const rest = friendlies.slice(topN);
   const labels = data.encounters.map(m => `#${m.encounter_id}`);
+  // Delta mode is the only one that can go negative, so it renders as
+  // a filled area (positive above zero, negative below). Other modes
+  // stay as line-only so multiple actors don't visually compete.
+  const isDelta = isTanking && sessionSummarySettings.tankingMetric === 'delta';
   const datasets = top.map((a, i) => ({
     label: a.attacker,
-    data: a.per_encounter_rate,
-    backgroundColor: COLORS[i % COLORS.length] + '33',
+    data: rateForActor(a),
+    backgroundColor: COLORS[i % COLORS.length] + (isDelta ? '55' : '33'),
     borderColor: COLORS[i % COLORS.length],
-    borderWidth: 1.5, fill: false, pointRadius: 2, tension: 0.2,
+    borderWidth: 1.5,
+    fill: isDelta ? 'origin' : false,
+    pointRadius: 2, tension: 0.2,
     spanGaps: false,
   }));
   if (rest.length > 0) {
     const otherSeries = data.encounters.map((_, idx) =>
-      rest.reduce((s, a) => s + (a.per_encounter_rate[idx] || 0), 0));
+      rest.reduce((s, a) => s + (rateForActor(a)[idx] || 0), 0));
     datasets.push({
       label: `Other (${rest.length})`, data: otherSeries,
-      backgroundColor: COLORS[8] + '33', borderColor: COLORS[8],
-      borderWidth: 1, fill: false, pointRadius: 2, tension: 0.2,
+      backgroundColor: COLORS[8] + (isDelta ? '55' : '33'),
+      borderColor: COLORS[8],
+      borderWidth: 1,
+      fill: isDelta ? 'origin' : false,
+      pointRadius: 2, tension: 0.2,
       borderDash: [4, 4], spanGaps: false,
     });
   }
@@ -3683,9 +3861,9 @@ async function renderSessionSummary(scopedIds) {
         interaction: { mode: 'index', intersect: false },
         scales: {
           x: { ticks: { color: '#94a3b8' }, grid: { color: '#2a3142' } },
-          y: { beginAtZero: true,
+          y: { beginAtZero: !isDelta,
                ticks: { color: '#94a3b8',
-                        callback: v => SHORT(v) + ' ' + mode.rateLabel },
+                        callback: v => SHORT(v) + ' ' + rateLabelForChart },
                grid: { color: '#2a3142' } },
         },
         plugins: {
@@ -3698,7 +3876,7 @@ async function renderSessionSummary(scopedIds) {
                 const status = enc.fight_complete ? 'killed' : 'incomplete';
                 return `#${enc.encounter_id}: ${enc.name} (${status})`;
               },
-              label: ctx => `${ctx.dataset.label}: ${SHORT(ctx.parsed.y)} ${mode.rateLabel}`,
+              label: ctx => `${ctx.dataset.label}: ${SHORT(ctx.parsed.y)} ${rateLabelForChart}`,
             },
           },
         },
@@ -3747,23 +3925,26 @@ function ssTableHTML(rows, mode) {
     </div>`;
 }
 
-function ssHeatmapHTML(rows, encounters, mode) {
+function ssHeatmapHTML(rows, encounters, mode, tankMetric) {
   if (rows.length === 0 || encounters.length === 0) {
     return '<div class="sub">No data.</div>';
   }
-  // Color intensity scales with rate / max rate observed in the matrix.
-  // Not log-scaled — most encounters cluster within an order of
-  // magnitude of each other; if that turns out to be wrong on real
-  // raid data we can switch to log. Cells with zero render empty
-  // (no fill) so absences are visually distinct from low-rate
-  // encounters where the actor did show up.
-  let maxRate = 0;
-  for (const a of rows) {
-    for (const v of a.per_encounter_rate) {
-      if (v > maxRate) maxRate = v;
+  // Pull the right per-encounter array per row. For tanking + delta, the
+  // values can be negative (net loss); we color positive blue and
+  // negative red with intensity scaled to max abs value.
+  const rateOf = tankMetric ? tankMetric.rateOf : (a => a.per_encounter_rate);
+  const rateLabel = tankMetric ? tankMetric.rateLabel : mode.rateLabel;
+  const isDelta = tankMetric && tankMetric.label === 'Life delta';
+
+  let maxAbs = 0;
+  const rowRates = rows.map(a => rateOf(a));
+  for (const arr of rowRates) {
+    for (const v of arr) {
+      const av = Math.abs(v);
+      if (av > maxAbs) maxAbs = av;
     }
   }
-  if (maxRate === 0) maxRate = 1;
+  if (maxAbs === 0) maxAbs = 1;
 
   const headerCells = encounters.map(m => {
     const status = m.fight_complete ? 'killed' : 'incomplete';
@@ -3771,8 +3952,8 @@ function ssHeatmapHTML(rows, encounters, mode) {
     return `<th class="ss-heatmap-col-h" title="${escapeHTML(tip)}">${m.encounter_id}</th>`;
   }).join('');
 
-  const bodyRows = rows.map(a => {
-    const cells = a.per_encounter_rate.map((rate, idx) => {
+  const bodyRows = rows.map((a, rowIdx) => {
+    const cells = rowRates[rowIdx].map((rate, idx) => {
       const enc = encounters[idx];
       if (rate === 0) {
         return `<td class="ss-heatmap-empty"
@@ -3781,11 +3962,13 @@ function ssHeatmapHTML(rows, encounters, mode) {
       }
       // Intensity in [0.15, 1.0] so even small values get a visible
       // fill; pure 0..1 makes 5%-of-max cells nearly invisible.
-      const alpha = 0.15 + 0.85 * (rate / maxRate);
+      const alpha = 0.15 + 0.85 * (Math.abs(rate) / maxAbs);
+      // Blue for positive (or non-delta), red for negative-delta.
+      const rgb = (isDelta && rate < 0) ? '248, 113, 113' : '96, 165, 250';
       return `<td class="ss-heatmap-cell"
-                  style="background: rgba(96, 165, 250, ${alpha.toFixed(3)})"
+                  style="background: rgba(${rgb}, ${alpha.toFixed(3)})"
                   data-encounter-id="${enc.encounter_id}"
-                  title="${escapeHTML(a.attacker)} — ${SHORT(rate)} ${mode.rateLabel} in #${enc.encounter_id}: ${escapeHTML(enc.name)}">${SHORT(rate)}</td>`;
+                  title="${escapeHTML(a.attacker)} — ${SHORT(rate)} ${rateLabel} in #${enc.encounter_id}: ${escapeHTML(enc.name)}">${SHORT(rate)}</td>`;
     }).join('');
     return `<tr>
       <th class="ss-heatmap-row-h" title="${escapeHTML(a.attacker)}">${escapeHTML(a.attacker)}</th>
@@ -3861,16 +4044,52 @@ function buildStackedChart(canvasId, timeline, unit) {
 
 let pairChartInstance = null;
 
-function showPairChart(pair, labels, bucketSeconds) {
+function showPairChart(pair, labels, bucketSeconds, metricArg) {
   // Tear down any previous modal/chart first so reopening is idempotent.
   const existing = document.getElementById('pair-modal');
   if (existing) existing.remove();
   if (pairChartInstance) { pairChartInstance.destroy(); pairChartInstance = null; }
 
-  const unit = pair.unit || 'DPS';
-  const amountLabel = (pair.amountLabel || 'damage').toLowerCase();
-  const countLabel = (pair.countLabel || 'hits').toLowerCase();
-  const allHits = pair.hits_detail || [];
+  // Tanking pairs can carry an extra heals_series/heals_detail attached
+  // server-side. When present, the modal shows a damage/healing/delta
+  // toggle and `metric` selects which dataset drives the chart and the
+  // by-source breakdown. Damage and healing reuse the full windowing/
+  // source-filter machinery; delta is a simpler chart-only view since
+  // it's a derived series with no individual events.
+  const supportsToggle = !!pair.heals_series;
+  const metric = supportsToggle ? (metricArg || 'damage') : 'damage';
+  const isDelta = metric === 'delta';
+
+  let allHits, primarySeries, primaryTotal, unit, amountLabel, countLabel;
+  if (metric === 'healing') {
+    allHits = pair.heals_detail || [];
+    primarySeries = pair.heals_series || [];
+    primaryTotal = pair.heals_total || 0;
+    unit = 'HPS in';
+    amountLabel = 'healing';
+    countLabel = 'heals';
+  } else if (metric === 'delta') {
+    // Delta = heals - damage per bucket. No individual events to
+    // window/filter, so source breakdown and the click-to-window UX
+    // are disabled in this mode (allHits stays empty).
+    allHits = [];
+    const dmg = pair.series || [];
+    const heal = pair.heals_series || [];
+    const len = Math.max(dmg.length, heal.length);
+    primarySeries = Array.from({length: len}, (_, i) =>
+      (heal[i] || 0) - (dmg[i] || 0));
+    primaryTotal = (pair.heals_total || 0) - (pair.damage || 0);
+    unit = 'ΔHP/s';
+    amountLabel = 'net life';
+    countLabel = 'buckets';
+  } else {
+    allHits = pair.hits_detail || [];
+    primarySeries = pair.series || [];
+    primaryTotal = pair.damage || 0;
+    unit = pair.unit || 'DPS';
+    amountLabel = (pair.amountLabel || 'damage').toLowerCase();
+    countLabel = (pair.countLabel || 'hits').toLowerCase();
+  }
   const nBuckets = labels.length;
 
   // Group hits by source for the right-column breakdown. Sources are
@@ -3897,14 +4116,36 @@ function showPairChart(pair, labels, bucketSeconds) {
       <td class="num">${s.hits}</td>
     </tr>`).join('');
 
+  // Hide the source-breakdown column for delta — there are no
+  // individual events to credit. Damage and healing keep their full
+  // by-source table even when the toggle is present.
+  const showSourcePanel = !isDelta;
+  const subTotal = primaryTotal;
+  const subCount = allHits.length;
+  const toggleHTML = !supportsToggle ? '' : `
+    <div class="pair-metric-toggle">
+      ${['damage', 'healing', 'delta'].map(k => {
+        const m = TANK_METRICS[k];
+        const isActive = k === metric;
+        return `<button class="ss-metric-btn ${isActive ? 'active' : ''}"
+                        data-pair-metric="${k}"
+                        title="${m.label}">${m.shortLabel}</button>`;
+      }).join('')}
+    </div>`;
+
   const modal = document.createElement('div');
   modal.id = 'pair-modal';
   modal.className = 'modal-backdrop';
   modal.innerHTML = `
-    <div class="modal pair-modal">
+    <div class="modal pair-modal ${showSourcePanel ? '' : 'no-source-panel'}">
       <button class="modal-close" aria-label="Close">×</button>
-      <h3>${escapeHTML(pair.attacker)} → ${escapeHTML(pair.target)}</h3>
-      <div class="modal-sub" id="pair-sub">${NUM(pair.damage)} ${amountLabel} · ${pair.hits} ${countLabel}</div>
+      <div class="pair-modal-head">
+        <div>
+          <h3>${escapeHTML(pair.attacker)} → ${escapeHTML(pair.target)}</h3>
+          <div class="modal-sub" id="pair-sub">${NUM(subTotal)} ${amountLabel} · ${subCount} ${countLabel}</div>
+        </div>
+        ${toggleHTML}
+      </div>
       <div class="pair-body">
         <div class="pair-left">
           <div class="pair-chart-wrap">
@@ -3912,11 +4153,13 @@ function showPairChart(pair, labels, bucketSeconds) {
             <button type="button" id="pair-clear" class="pair-clear-btn" style="display:none">Clear</button>
           </div>
           <div class="pair-stats" id="pair-stats"></div>
+          ${isDelta ? '' : `
           <div class="pair-hits-help sub">
             Click the chart to set a 5s window, then drag the yellow edges to widen it (5s steps).
           </div>
-          <div id="pair-hits-list"></div>
+          <div id="pair-hits-list"></div>`}
         </div>
+        ${!showSourcePanel ? '' : `
         <div class="pair-right">
           <table class="source-breakdown">
             <caption>By source — click to filter</caption>
@@ -3927,7 +4170,7 @@ function showPairChart(pair, labels, bucketSeconds) {
             </tr></thead>
             <tbody>${sourceRows}</tbody>
           </table>
-        </div>
+        </div>`}
       </div>
     </div>`;
   document.body.appendChild(modal);
@@ -3938,9 +4181,22 @@ function showPairChart(pair, labels, bucketSeconds) {
   };
   modal.addEventListener('click', e => { if (e.target === modal) close(); });
   modal.querySelector('.modal-close').addEventListener('click', close);
-  modal.querySelector('#pair-clear').addEventListener('click', ev => {
-    ev.stopPropagation();
-    clearWindow();
+  const clearBtn = modal.querySelector('#pair-clear');
+  if (clearBtn) {
+    clearBtn.addEventListener('click', ev => {
+      ev.stopPropagation();
+      clearWindow();
+    });
+  }
+  // Tanking-only metric toggle. Re-opens the modal with the new metric;
+  // simpler than swapping data on the existing chart since the windowing
+  // closure captures the current metric's data.
+  modal.querySelectorAll('.pair-metric-toggle [data-pair-metric]').forEach(btn => {
+    btn.addEventListener('click', ev => {
+      ev.stopPropagation();
+      const m = btn.dataset.pairMetric;
+      if (m !== metric) showPairChart(pair, labels, bucketSeconds, m);
+    });
   });
 
   // Filter state — null means "all". Captured via closure so re-opening
@@ -4127,7 +4383,12 @@ function showPairChart(pair, labels, bucketSeconds) {
 
   // Build the chart with the unfiltered data, then call refresh() so the
   // stats panel and other pieces render through the same code path.
-  const initialSeries = buildSeries(allHits).map(v => v / bucketSeconds);
+  // For delta, primarySeries is already the per-bucket delta (heals -
+  // damage); we just convert to a per-second rate. For damage/healing,
+  // we build from hits so the windowing/source-filter path works.
+  const initialSeries = isDelta
+    ? primarySeries.map(v => v / bucketSeconds)
+    : buildSeries(allHits).map(v => v / bucketSeconds);
   pairChartInstance = new Chart(document.getElementById('pair-chart'), {
     type: 'line',
     plugins: [windowOverlayPlugin],
@@ -4139,7 +4400,9 @@ function showPairChart(pair, labels, bucketSeconds) {
         backgroundColor: COLORS[0] + 'cc',
         borderColor: COLORS[0],
         borderWidth: 1.5,
-        fill: true,
+        // Delta fills from origin so positives sit above zero and
+        // negatives below; damage/healing fill to the bottom as before.
+        fill: isDelta ? 'origin' : true,
         pointRadius: 0,
         tension: 0.3,
       }],
@@ -4148,7 +4411,7 @@ function showPairChart(pair, labels, bucketSeconds) {
       responsive: true,
       scales: {
         x: { ticks: { color: '#94a3b8' }, grid: { color: '#2a3142' } },
-        y: { beginAtZero: true,
+        y: { beginAtZero: !isDelta,
              ticks: { color: '#94a3b8',
                       callback: v => SHORT(v) + ' ' + unit },
              grid: { color: '#2a3142' } },
@@ -4163,8 +4426,13 @@ function showPairChart(pair, labels, bucketSeconds) {
   // Pointer events for setting and dragging the selection window. Pointer
   // capture means a drag started near an edge keeps tracking even if the
   // cursor leaves the canvas, so the user doesn't lose the gesture by
-  // overshooting.
+  // overshooting. Skipped for delta mode — there are no individual
+  // events to drill into, so windowing has nothing to show.
   const canvas = pairChartInstance.canvas;
+  if (isDelta) {
+    refresh();
+    return;
+  }
   canvas.addEventListener('pointerdown', ev => {
     const rect = canvas.getBoundingClientRect();
     const x = ev.clientX - rect.left;
