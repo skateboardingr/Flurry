@@ -1315,6 +1315,61 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
         payload['healing'] = _build_healing_block(
             e, bucket_seconds, payload['timeline']['labels'], sides_by_name)
 
+        # Build the tanking-side block from merged.defends_by_pair.
+        # Friendly-focused: a defender shows up in the tanking tab if
+        # they took damage and aren't classified as enemy. Defenders not
+        # in `sides_by_name` (e.g. pure-tank classes who only blocked and
+        # never landed a swing) get a fallback friendly classification —
+        # better to include them than silently drop the tank from their
+        # own tab. Enemies' damage taken is already on the Damage tab's
+        # Enemies section.
+        defenders_map: dict = {}
+        for (atk_name, def_name), d in merged.defends_by_pair.items():
+            if _is_corpse(atk_name) or _is_corpse(def_name):
+                continue
+            side = sides_by_name.get(def_name.lower(), 'friendly')
+            if side == 'enemy':
+                continue
+            rec = defenders_map.setdefault(def_name.lower(), {
+                'defender': def_name,
+                'damage_taken': 0,
+                'hits_landed': 0,
+                'biggest_taken': 0,
+                'avoided': {},        # outcome -> count, aggregated across attackers
+                'breakdown': [],      # per-attacker rows
+            })
+            rec['damage_taken'] += d.damage_taken
+            rec['hits_landed'] += d.hits_landed
+            if d.biggest_taken > rec['biggest_taken']:
+                rec['biggest_taken'] = d.biggest_taken
+            for outcome, n in d.avoided.items():
+                rec['avoided'][outcome] = rec['avoided'].get(outcome, 0) + n
+            # Pull the per-(attacker, defender) bucketed series and per-hit
+            # detail from the damage matrix so the breakdown row can pop
+            # the same DTPS-over-time modal the Damage tab uses. A pair
+            # whose only events were avoidances has an empty series; the
+            # modal handles that gracefully.
+            cell = matrix.get((atk_name.lower(), def_name.lower()))
+            series = list(cell['series']) if cell else [0] * n_buckets
+            hits_detail = list(cell['hits_detail']) if cell else []
+            rec['breakdown'].append({
+                'attacker': atk_name,
+                'damage_taken': d.damage_taken,
+                'hits_landed': d.hits_landed,
+                'biggest_taken': d.biggest_taken,
+                'avoided': dict(d.avoided),
+                'series': series,
+                'hits_detail': hits_detail,
+            })
+        defenders = []
+        for rec in defenders_map.values():
+            rec['breakdown'].sort(key=lambda r: (r['damage_taken'], r['hits_landed']),
+                                  reverse=True)
+            defenders.append(rec)
+        defenders.sort(key=lambda r: (r['damage_taken'], r['hits_landed']),
+                       reverse=True)
+        payload['defenders'] = defenders
+
         # Pet-owner state — the front-end shows it in the per-attacker
         # edit modal so the user can see (and clear) existing assignments.
         # `raw_attackers` is the list of original (un-rewritten) attacker
@@ -1533,6 +1588,14 @@ _INDEX_HTML = r'''<!DOCTYPE html>
                        border-bottom: 1px solid var(--border); }
   tr.pair-row-all:hover td { background: rgba(96, 165, 250, 0.16); }
   tr.pair-row-all td:first-child { color: var(--text-bright); }
+
+  /* Tanking table — denser cells than the damage tables because 12
+     columns get cramped at the default padding. */
+  .tanking-table th, .tanking-table td,
+  .tanking-breakdown th, .tanking-breakdown td {
+    padding: 6px 10px; font-size: 0.85rem;
+  }
+  .tanking-table th.num, .tanking-breakdown th.num { font-size: 0.75rem; }
 
   /* Pair-detail modal */
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.65);
@@ -2858,6 +2921,16 @@ async function renderEncounter(id) {
     pairAmountLabel: 'Healing', pairCountLabel: 'Casts',
     dealtHeading: 'Healing dealt to', takenHeading: 'Healing taken from',
   };
+  // Used by the Tanking tab. Series for tanking pairs are bucketed off
+  // the damage timeline (same labels), so the modal's pair.unit-based
+  // label lookup falls through to f.timeline correctly.
+  const KIND_TANKING = {
+    who: 'Defender', amount: 'Damage', rate: 'DTPS', count: 'Hits',
+    showMisses: false, biggestLabel: 'Biggest', unit: 'DTPS',
+    pairLeftLabelTarget: 'Defender', pairLeftLabelSource: 'Attacker',
+    pairAmountLabel: 'Damage', pairCountLabel: 'Hits',
+    dealtHeading: 'Damage taken from', takenHeading: 'Damage dealt to',
+  };
 
   const registerPair = (attacker, target, row, kind) => {
     const id = `pair-${++_pairId}`;
@@ -3083,10 +3156,158 @@ async function renderEncounter(id) {
     ? '<div class="panel sub">No healing recorded in this encounter.</div>'
     : (healTablesHTML + healChartHTML + healBiggestHTML);
 
+  // ---- Tanking tab ----
+  // Friendly-focused view of damage taken, ordered by damage_taken desc,
+  // with a per-outcome avoidance breakdown (parry/block/dodge/rune/invuln/
+  // miss/riposte) the existing Damage tab doesn't surface. Each row
+  // expands into a per-attacker breakdown using the same columns.
+  const tanking = f.defenders || [];
+  const hasTanking = tanking.length > 0;
+  const tankingTotalDamage = tanking.reduce(
+    (sum, d) => sum + (d.damage_taken || 0), 0);
+  const AVOID_KEYS = ['parry','block','dodge','rune','invulnerable','miss','riposte'];
+  const sumAvoid = (av) => AVOID_KEYS.reduce((s, k) => s + ((av || {})[k] || 0), 0);
+  const avoidPct = (avoided, hits) => {
+    const swings = hits + avoided;
+    return swings > 0 ? Math.round(avoided / swings * 1000) / 10 : 0;
+  };
+  // Each tanking breakdown row registers as a pair so clicking it opens
+  // the same DTPS-over-time modal that Damage and Healing tabs use. We
+  // pass the breakdown row's series + hits_detail (pulled server-side
+  // from the damage matrix) and let registerPair attach unit/labels.
+  const tankBreakdownRow = (br, defenderName) => {
+    const avoided = sumAvoid(br.avoided);
+    const swings = br.hits_landed + avoided;
+    const pairRow = {
+      damage: br.damage_taken, hits: br.hits_landed,
+      series: br.series || [], hits_detail: br.hits_detail || [],
+    };
+    const pairId = registerPair(br.attacker, defenderName, pairRow, KIND_TANKING);
+    return `<tr class="pair-row" data-pair-id="${pairId}">
+      <td>${escapeHTML(br.attacker)}</td>
+      <td class="num">${NUM(br.damage_taken)}</td>
+      <td class="num">${NUM(swings)}</td>
+      <td class="num">${avoidPct(avoided, br.hits_landed)}%</td>
+      <td class="num">${br.avoided.parry || 0}</td>
+      <td class="num">${br.avoided.block || 0}</td>
+      <td class="num">${br.avoided.dodge || 0}</td>
+      <td class="num">${br.avoided.rune || 0}</td>
+      <td class="num">${br.avoided.invulnerable || 0}</td>
+      <td class="num">${br.avoided.miss || 0}</td>
+      <td class="num">${br.avoided.riposte || 0}</td>
+      <td class="num">${NUM(br.biggest_taken)}</td>
+    </tr>`;
+  };
+  const tankRowHTML = (d, idx) => {
+    const avoided = sumAvoid(d.avoided);
+    const swings = d.hits_landed + avoided;
+    const detailId = `tank-detail-${idx}`;
+    // Synthesize an "All" row at the top of the breakdown that aggregates
+    // every attacker's series and hits_detail, so a click pops a modal
+    // showing total damage taken by this defender across all sources.
+    // Mirrors the breakdownTable helper's All-row pattern on Damage/Healing.
+    let allSeries = null;
+    const allHitsDetail = [];
+    for (const br of d.breakdown) {
+      if (Array.isArray(br.series)) {
+        if (allSeries === null) {
+          allSeries = br.series.slice();
+        } else {
+          const len = Math.max(allSeries.length, br.series.length);
+          for (let i = 0; i < len; i++) {
+            allSeries[i] = (allSeries[i] || 0) + (br.series[i] || 0);
+          }
+        }
+      }
+      if (Array.isArray(br.hits_detail)) {
+        for (const h of br.hits_detail) allHitsDetail.push(h);
+      }
+    }
+    const allPairRow = {
+      damage: d.damage_taken, hits: d.hits_landed,
+      series: allSeries || [], hits_detail: allHitsDetail,
+    };
+    const allPairId = registerPair('All', d.defender, allPairRow, KIND_TANKING);
+    const allBreakdownRow = `
+      <tr class="pair-row pair-row-all" data-pair-id="${allPairId}">
+        <td><strong>All</strong></td>
+        <td class="num"><strong>${NUM(d.damage_taken)}</strong></td>
+        <td class="num"><strong>${NUM(swings)}</strong></td>
+        <td class="num"><strong>${avoidPct(avoided, d.hits_landed)}%</strong></td>
+        <td class="num"><strong>${d.avoided.parry || 0}</strong></td>
+        <td class="num"><strong>${d.avoided.block || 0}</strong></td>
+        <td class="num"><strong>${d.avoided.dodge || 0}</strong></td>
+        <td class="num"><strong>${d.avoided.rune || 0}</strong></td>
+        <td class="num"><strong>${d.avoided.invulnerable || 0}</strong></td>
+        <td class="num"><strong>${d.avoided.miss || 0}</strong></td>
+        <td class="num"><strong>${d.avoided.riposte || 0}</strong></td>
+        <td class="num"><strong>${NUM(d.biggest_taken)}</strong></td>
+      </tr>`;
+    return `
+    <tr class="attacker-row" data-toggle="${detailId}">
+      <td><span class="expand">▶</span>${escapeHTML(d.defender)}</td>
+      <td class="num">${NUM(d.damage_taken)}</td>
+      <td class="num">${NUM(swings)}</td>
+      <td class="num">${avoidPct(avoided, d.hits_landed)}%</td>
+      <td class="num">${d.avoided.parry || 0}</td>
+      <td class="num">${d.avoided.block || 0}</td>
+      <td class="num">${d.avoided.dodge || 0}</td>
+      <td class="num">${d.avoided.rune || 0}</td>
+      <td class="num">${d.avoided.invulnerable || 0}</td>
+      <td class="num">${d.avoided.miss || 0}</td>
+      <td class="num">${d.avoided.riposte || 0}</td>
+      <td class="num">${NUM(d.biggest_taken)}</td>
+    </tr>
+    <tr class="attacker-detail" id="${detailId}" style="display:none">
+      <td colspan="12">
+        <table class="tanking-breakdown">
+          <thead><tr>
+            <th>Attacker</th>
+            <th class="num">Damage</th>
+            <th class="num">Swings</th>
+            <th class="num">Avoid %</th>
+            <th class="num">Parry</th>
+            <th class="num">Block</th>
+            <th class="num">Dodge</th>
+            <th class="num">Rune</th>
+            <th class="num">Invuln</th>
+            <th class="num">Miss</th>
+            <th class="num">Rip</th>
+            <th class="num">Biggest</th>
+          </tr></thead>
+          <tbody>${allBreakdownRow}${d.breakdown.map(br => tankBreakdownRow(br, d.defender)).join('')}</tbody>
+        </table>
+      </td>
+    </tr>`;
+  };
+  const tankingTabHTML = !hasTanking
+    ? '<div class="panel sub">No incoming damage tracked in this encounter.</div>'
+    : `<h2>Tanks (${tanking.length})</h2>
+       <div class="panel">
+         <table class="tanking-table">
+           <thead><tr>
+             <th>Defender</th>
+             <th class="num">Dmg Taken</th>
+             <th class="num">Swings</th>
+             <th class="num">Avoid %</th>
+             <th class="num">Parry</th>
+             <th class="num">Block</th>
+             <th class="num">Dodge</th>
+             <th class="num">Rune</th>
+             <th class="num">Invuln</th>
+             <th class="num">Miss</th>
+             <th class="num">Rip</th>
+             <th class="num">Biggest</th>
+           </tr></thead>
+           <tbody>${tanking.map((d, i) => tankRowHTML(d, i)).join('')}</tbody>
+         </table>
+       </div>`;
+
   const tabsHTML = `
     <div class="tabs">
       <button class="tab active" data-tab="damage">Damage (${NUM(f.total_damage)})</button>
       <button class="tab" data-tab="healing">Healing (${NUM(healingData.total_healing)})</button>
+      <button class="tab" data-tab="tanking">Tanking (${NUM(tankingTotalDamage)})</button>
     </div>`;
 
   // Members panel sits OUTSIDE the tab content because it's encounter-
@@ -3096,6 +3317,7 @@ async function renderEncounter(id) {
   app.innerHTML = summaryHTML + tabsHTML +
     `<div id="tab-damage">${dpsTableHTML}${specialsHTML}${dmgChartHTML}${dmgBiggestHTML}</div>` +
     `<div id="tab-healing" style="display:none">${healingTabHTML}</div>` +
+    `<div id="tab-tanking" style="display:none">${tankingTabHTML}</div>` +
     membersHTML;
 
   // Toggle the per-attacker drilldown row when the parent row is clicked.
@@ -3139,6 +3361,8 @@ async function renderEncounter(id) {
         which === 'damage' ? '' : 'none';
       document.getElementById('tab-healing').style.display =
         which === 'healing' ? '' : 'none';
+      document.getElementById('tab-tanking').style.display =
+        which === 'tanking' ? '' : 'none';
       if (which === 'healing' && hasHealing && !healingChartBuilt) {
         buildStackedChart('heal-chart', healingData.timeline, 'HPS');
         healingChartBuilt = true;

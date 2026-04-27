@@ -76,6 +76,31 @@ def test_apply_pet_owners_merges_hits_into_owner():
         _cleanup(path)
 
 
+def test_apply_pet_owners_rewrites_defends_attacker_side():
+    """A pet's swings against a defender should be reattributed to its
+    owner in defends_by_pair too, so the tank UI shows 'Soloson hit me
+    N times' rather than splitting the rollup across raw pet names."""
+    path = _write_log([
+        (0, 'Onyx Crusher slashes Tank for 5000 points of damage.'),
+        (1, 'Onyx Crusher tries to slash Tank, but Tank parries!'),
+        (2, 'Soloson slashes Tank for 1000 points of damage.'),
+        (3, 'Tank has been slain by Onyx Crusher!'),
+    ])
+    try:
+        fights = detect_fights(path, min_damage=0)
+        rewritten, _ = apply_pet_owners(fights, [], {'Onyx Crusher': 'Soloson'})
+        f = rewritten[0]
+        # Pet's pair key should now be (Soloson, Tank), summed with
+        # Soloson's own swing against Tank.
+        assert ('Onyx Crusher', 'Tank') not in f.defends_by_pair
+        pair = f.defends_by_pair[('Soloson', 'Tank')]
+        assert pair.hits_landed == 2, f'hits_landed: {pair.hits_landed}'
+        assert pair.damage_taken == 6_000
+        assert pair.avoided.get('parry') == 1
+    finally:
+        _cleanup(path)
+
+
 def test_apply_pet_owners_owner_own_hits_sum_with_pet_hits():
     """When the owner's own hits exist alongside pet hits, both
     contribute to the owner's AttackerStats. pet_origin distinguishes

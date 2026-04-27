@@ -244,6 +244,50 @@ def test_multiple_attackers_attributed_correctly():
         _cleanup(path)
 
 
+def test_defends_by_pair_populated_from_hits_and_misses():
+    """Each landed hit and each avoided swing should bump the per-pair
+    DefenseStats from the defender's perspective. Outcome counts (parry,
+    block, dodge, rune, invuln, riposte, miss) are all tracked by label."""
+    path = _write_log([
+        # A boss whacking on the tank with a varied mix of outcomes.
+        (0,  'A nasty boss hits Tank for 9000 points of damage.'),
+        (1,  'A nasty boss hits Tank for 11000 points of damage. (Critical)'),
+        (2,  'A nasty boss tries to hit Tank, but Tank parries!'),
+        (3,  'A nasty boss tries to hit Tank, but Tank dodges!'),
+        (4,  'A nasty boss tries to hit Tank, but Tank blocks with his shield!'),
+        (5,  "A nasty boss tries to hit Tank, but Tank's magical skin absorbs the blow!"),
+        (6,  'A nasty boss tries to hit Tank, but Tank is INVULNERABLE!'),
+        (7,  'A nasty boss tries to hit Tank, but Tank ripostes!'),
+        (8,  'A nasty boss tries to hit Tank, but misses!'),
+        # And a parallel attacker so we know the pair key actually splits.
+        (9,  'An add hits Tank for 500 points of damage.'),
+        (10, 'A nasty boss has been slain by You!'),
+        (11, 'You slash A nasty boss for 30000 points of damage.'),
+    ])
+    try:
+        fights = detect_fights(path, min_damage=0)
+        # `detect_fights` produces one fight per *target*, so the boss-
+        # hitting-tank events live in the Tank-as-target fight, not the
+        # boss-as-target fight. The encounter view later merges these.
+        tank_fight = next(f for f in fights if f.target.lower() == 'tank')
+        pair = tank_fight.defends_by_pair[('A nasty boss', 'Tank')]
+        assert pair.hits_landed == 2, f'hits_landed: {pair.hits_landed}'
+        assert pair.damage_taken == 20_000, f'damage_taken: {pair.damage_taken}'
+        assert pair.biggest_taken == 11_000, f'biggest_taken: {pair.biggest_taken}'
+        assert pair.avoided == {
+            'parry': 1, 'dodge': 1, 'block': 1, 'rune': 1,
+            'invulnerable': 1, 'riposte': 1, 'miss': 1,
+        }, f'avoided: {pair.avoided}'
+        assert pair.total_avoided == 7
+        assert pair.total_swings == 9
+        # Second attacker → separate pair on the same Tank fight.
+        add_pair = tank_fight.defends_by_pair[('An add', 'Tank')]
+        assert add_pair.hits_landed == 1
+        assert add_pair.damage_taken == 500
+    finally:
+        _cleanup(path)
+
+
 def test_misses_extend_fight_window():
     """A run of misses against a target keeps its fight alive past gap."""
     path = _write_log([

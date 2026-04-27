@@ -117,6 +117,42 @@ class HealerStats:
     spell_casts: Dict[str, int] = field(default_factory=dict)
 
 
+# Outcome labels used in DefenseStats.avoided. Match MeleeMiss.outcome
+# values so we can populate from a parsed event without translation.
+DEFENSE_OUTCOMES = ('miss', 'riposte', 'parry', 'block', 'dodge', 'rune', 'invulnerable')
+
+
+@dataclass
+class DefenseStats:
+    """Per-(attacker, defender) accumulator from the defender's perspective.
+
+    Counts every swing one attacker took at one defender during a fight,
+    breaking down the misses by `outcome` so the tank UI can show how the
+    avoidance shook out (parry vs block vs dodge vs rune vs invulnerable
+    vs plain miss vs riposte). `damage_taken` and `biggest_taken` record
+    landed damage; `avoided` is keyed by the same outcome label MeleeMiss
+    carries.
+
+    Built alongside AttackerStats inside `_FightBuilder` — every hit and
+    every miss bumps both the attacker side (AttackerStats) and the
+    defender side (this), so no separate event walk is needed.
+    """
+    attacker: str
+    defender: str
+    damage_taken: int = 0
+    hits_landed: int = 0
+    biggest_taken: int = 0
+    avoided: Dict[str, int] = field(default_factory=dict)
+
+    @property
+    def total_avoided(self) -> int:
+        return sum(self.avoided.values())
+
+    @property
+    def total_swings(self) -> int:
+        return self.hits_landed + self.total_avoided
+
+
 @dataclass
 class FightResult:
     """Everything we computed about one fight.
@@ -131,6 +167,12 @@ class FightResult:
     stats_by_attacker: Dict[str, AttackerStats]
     fight_complete: bool       # True only if we saw the target's death event
     fight_id: Optional[int] = None  # set by detect_fights(); None for analyze_fight()
+    # Per-(attacker, defender) accumulator from the defender's perspective.
+    # Populated in lockstep with stats_by_attacker so the tank-view UI can
+    # show how each attacker's swings landed or were avoided. Keyed by the
+    # raw (attacker, defender) tuple — pet-owner rewrites remap the
+    # attacker side via apply_pet_owners.
+    defends_by_pair: Dict[Tuple[str, str], DefenseStats] = field(default_factory=dict)
 
     @property
     def duration_seconds(self) -> float:
@@ -190,6 +232,7 @@ class _FightBuilder:
         self.special_mods = special_mods
         self.hits: List[Hit] = []
         self.stats: Dict[str, AttackerStats] = {}
+        self.defends: Dict[Tuple[str, str], DefenseStats] = {}
 
     def _get_stats(self, attacker: str) -> AttackerStats:
         s = self.stats.get(attacker)
@@ -197,6 +240,14 @@ class _FightBuilder:
             s = AttackerStats(attacker=attacker)
             self.stats[attacker] = s
         return s
+
+    def _get_defense(self, attacker: str, defender: str) -> DefenseStats:
+        key = (attacker, defender)
+        d = self.defends.get(key)
+        if d is None:
+            d = DefenseStats(attacker=attacker, defender=defender)
+            self.defends[key] = d
+        return d
 
     def record_hit(self, ev, kind: str):
         specials = extract_specials(ev.modifiers, self.special_mods)
@@ -227,12 +278,20 @@ class _FightBuilder:
         for special in specials:
             s.special_damage[special] = s.special_damage.get(special, 0) + ev.damage
             s.special_hits[special] = s.special_hits.get(special, 0) + 1
+        d = self._get_defense(ev.attacker, ev.target)
+        d.damage_taken += ev.damage
+        d.hits_landed += 1
+        if ev.damage > d.biggest_taken:
+            d.biggest_taken = ev.damage
         self.last_ts = ev.timestamp
 
     def record_miss(self, ev):
         # A miss against the target is still combat activity — extend the
         # fight window so a target you can't seem to land on doesn't expire.
         self._get_stats(ev.attacker).misses += 1
+        outcome = getattr(ev, 'outcome', 'miss')
+        d = self._get_defense(ev.attacker, ev.target)
+        d.avoided[outcome] = d.avoided.get(outcome, 0) + 1
         self.last_ts = ev.timestamp
 
     def finalize(self, end: datetime, fight_complete: bool,
@@ -245,6 +304,7 @@ class _FightBuilder:
             stats_by_attacker=self.stats,
             fight_complete=fight_complete,
             fight_id=fight_id,
+            defends_by_pair=self.defends,
         )
 
 
@@ -774,6 +834,24 @@ def merge_encounter(encounter: 'Encounter') -> FightResult:
             for special, n in s.special_hits.items():
                 cur.special_hits[special] = cur.special_hits.get(special, 0) + n
 
+    # Merge defender-perspective stats across member fights. Two members
+    # of the same encounter sometimes overlap when a boss + add are pulled
+    # together; the same (attacker, defender) pair can appear in both, so
+    # we sum into one DefenseStats per pair.
+    merged_defends: Dict[Tuple[str, str], DefenseStats] = {}
+    for m in encounter.members:
+        for key, d in m.defends_by_pair.items():
+            cur = merged_defends.get(key)
+            if cur is None:
+                cur = DefenseStats(attacker=d.attacker, defender=d.defender)
+                merged_defends[key] = cur
+            cur.damage_taken += d.damage_taken
+            cur.hits_landed += d.hits_landed
+            if d.biggest_taken > cur.biggest_taken:
+                cur.biggest_taken = d.biggest_taken
+            for outcome, n in d.avoided.items():
+                cur.avoided[outcome] = cur.avoided.get(outcome, 0) + n
+
     all_hits: List[Hit] = []
     for m in encounter.members:
         all_hits.extend(m.hits)
@@ -787,6 +865,7 @@ def merge_encounter(encounter: 'Encounter') -> FightResult:
         stats_by_attacker=merged,
         fight_complete=encounter.fight_complete,
         fight_id=encounter.encounter_id,
+        defends_by_pair=merged_defends,
     )
 
 
@@ -881,6 +960,24 @@ def apply_pet_owners(fights: List[FightResult],
                 s = AttackerStats(attacker=new_name)
                 new_stats[new_name] = s
             s.misses += old.misses
+        # Rewrite defender-perspective stats: only the attacker side is
+        # remapped (a pet's swings against a defender become the owner's
+        # swings against that defender). Two raw actors mapping to the
+        # same owner sum cleanly into one DefenseStats per pair.
+        new_defends: Dict[Tuple[str, str], DefenseStats] = {}
+        for (old_atk, defender), d in f.defends_by_pair.items():
+            new_atk = lookup.get(old_atk.lower(), old_atk)
+            key = (new_atk, defender)
+            cur = new_defends.get(key)
+            if cur is None:
+                cur = DefenseStats(attacker=new_atk, defender=defender)
+                new_defends[key] = cur
+            cur.damage_taken += d.damage_taken
+            cur.hits_landed += d.hits_landed
+            if d.biggest_taken > cur.biggest_taken:
+                cur.biggest_taken = d.biggest_taken
+            for outcome, n in d.avoided.items():
+                cur.avoided[outcome] = cur.avoided.get(outcome, 0) + n
         return FightResult(
             target=f.target,
             start=f.start,
@@ -889,6 +986,7 @@ def apply_pet_owners(fights: List[FightResult],
             stats_by_attacker=new_stats,
             fight_complete=f.fight_complete,
             fight_id=f.fight_id,
+            defends_by_pair=new_defends,
         )
 
     def _rewrite_heal(h: Heal) -> Heal:
