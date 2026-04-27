@@ -22,10 +22,19 @@ TAKP — anywhere EQ writes its standard log format.
 - First-person and third-person melee (`You slash X`, `Soloson slashes X`)
 - Pet damage (`Soloson\`s pet` — note the backtick, an EQ quirk)
 - Spells with named damage types (`You hit X for N points of cold damage by Strike of Ice`)
+- DoT ticks (`X has taken N damage from <spell> by <source>`)
 - Damage shields and weapon procs (`X is pierced by Y's thorns`)
+- Heals — direct and HoT, with self-heal pronoun normalization
+- All seven melee avoidance outcomes — `miss`, `riposte`, `parry`,
+  `block` (incl. `blocks with her shield!`), `dodge`, `rune`
+  (`magical skin absorbs the blow!`), `invulnerable` (divine aura)
+- Spell resists (`X resisted your Spell!`) as their own event type
 - Both death-message formats (`has been slain by` / `was slain by`)
 - Special attacks: Headshot, Assassinate, Slay Undead, Decapitate,
   Double Bow Shot, Flurry, Twincast, Rampage
+- Edge cases: hyphenated names (`Cazic-Thule`, `Terris-Thule`),
+  lowercase mob articles at body start (`a shadowstone grabber hit X`),
+  EQ's stray double-spaces between melee tokens, and falling damage
 
 ## Install
 
@@ -128,16 +137,46 @@ Or run `flurry.exe` (downloaded release) / double-click `flurry.bat`
 (source).
 
 Opens a browser tab pointing at `localhost:8765`. The session view lists
-every detected fight; click a row to drill into per-attacker DPS, special
-attacks, biggest hits, and a stacked-area timeline chart. The "Change log"
-button in the header re-opens the file picker so you can switch logs
-without restarting.
+every detected fight (auto-grouped into encounters when fights overlap),
+sortable by any column. Click a row to open the encounter detail page
+with three tabs:
+
+- **Damage** — per-attacker DPS table split into Friendlies / Enemies,
+  expandable into per-target damage breakdowns. Click any breakdown
+  row to pop a modal with a per-second chart, a click-to-window timeline
+  for drilling into a 5s slice, and a by-source filter (Slashes,
+  Backstabs, Strike of Ice, etc.).
+- **Healing** — same shape but for heals: per-healer HPS, per-(healer,
+  target) breakdowns, biggest-heals list, stacked-area HPS timeline.
+- **Tanking** — friendly defenders sorted by damage taken, with parry /
+  block / dodge / rune / invuln / miss / riposte counts and avoid %.
+  Each row expands into a per-attacker breakdown. Click any row (or the
+  bold **All** row at the top) to pop a DTPS-over-time modal with a
+  **Damage / Healing / Δ Life** toggle — Δ Life shows healing minus
+  damage per bucket, dipping below zero when net negative.
+
+A **Session summary** button on the session view opens a multi-fight
+rollup also split by Damage / Healing / Tanking tabs. Each tab shows a
+trend chart, an actor × encounter heatmap (click any cell to drill into
+that encounter), and a per-actor table with avg/median/p95/best rates.
+Tanking gets the same Damage / Healing / Δ Life sub-toggle on its chart
+and heatmap, with diverging blue/red colors for delta.
+
+Drag-and-drop a log file anywhere on the page to load it without going
+through the file picker. The **Change log** button in the header re-opens
+the picker so you can switch logs without restarting. The **Pet owners**
+button on encounter detail lets you assign owners to actors that don't
+carry the backtick-pet suffix in the log (mage water pets, charmed mobs);
+assignments persist to a `<logfile>.flurry.json` sidecar next to the log.
 
 Useful flags:
 
 - `--port N`: pick a different port (default 8765)
 - `--gap N`, `--min-damage N`: same as the `session` subcommand
 - `--bucket N`: timeline bucket size in seconds (default 5)
+- `--encounter-gap N`: window for grouping fights into encounters (default 10)
+- `--since-hours N`: only parse the last N hours of the log (default 8;
+  set to 0 for the whole log)
 - `--no-browser`: don't auto-open a browser tab
 
 ### Auto-detect every fight in a log
@@ -197,23 +236,32 @@ Useful flags:
 Flurry can also be used as a Python library:
 
 ```python
-from flurry import analyze_fight, detect_fights, bucket_hits
+from flurry import (
+    analyze_fight, detect_fights, detect_combat,
+    group_into_encounters, merge_encounter, bucket_hits,
+)
 from flurry.report import text_dps_report, html_timeline_report
 
-# Auto-detect every fight in a log.
-fights = detect_fights('eqlog_Hacral_firiona.txt')
-for f in fights:
-    print(f'#{f.fight_id} {f.target}: {f.total_damage:,} ({f.duration_seconds:.0f}s)')
+# detect_combat returns both fights and a flat heal list in one walk.
+fights, heals = detect_combat('eqlog_Hacral_firiona.txt')
+encounters = group_into_encounters(fights, gap_seconds=10, heals=heals)
 
-# Or analyze a specific named target.
+for enc in encounters:
+    flat = merge_encounter(enc)
+    print(f'#{enc.encounter_id} {enc.name}: {flat.total_damage:,} '
+          f'({flat.duration_seconds:.0f}s, {len(enc.heals)} heals)')
+
+# Or analyze one specific target without auto-detection.
 result = analyze_fight('eqlog_Hacral_firiona.txt', 'Shei Vinitras')
-
-# Print the same DPS table the CLI prints.
 print(text_dps_report(result))
 
-# Or work with the raw stats.
-top = result.attackers_by_damage()[0]
-print(f'{top.attacker} did {top.damage:,} damage ({top.crits} crits)')
+# Defender-perspective stats — what hit me, how often did they land,
+# how were the misses distributed.
+for (atk, defender), d in result.defends_by_pair.items():
+    if d.damage_taken == 0: continue
+    print(f'{atk} → {defender}: {d.damage_taken:,} dmg over '
+          f'{d.hits_landed} hits, {d.total_avoided} avoided '
+          f'({d.avoided})')
 
 # Build and render a timeline.
 timeline = bucket_hits(result, bucket_seconds=5)
@@ -221,20 +269,28 @@ with open('fight.html', 'w') as f:
     f.write(html_timeline_report(result, timeline))
 ```
 
-The `FightResult` dataclass exposes:
+Key types from `flurry`:
 
-- `target`, `start`, `end`, `duration_seconds`, `fight_complete`
-- `fight_id` — set by `detect_fights` (1-indexed by start time); `None`
-  for results from `analyze_fight`
-- `total_damage`, `raid_dps`
-- `hits` — list of every individual damage event
-- `stats_by_attacker` — dict of `AttackerStats` keyed by attacker name
-- `attackers_by_damage()` — sorted list, biggest first
-
-`AttackerStats` exposes:
-
-- `damage`, `hits`, `misses`, `crits`, `biggest`
-- `special_damage`, `special_hits` — dicts keyed by special-attack name
+- **`FightResult`** — `target`, `start`, `end`, `duration_seconds`,
+  `fight_complete`, `fight_id`, `total_damage`, `raid_dps`, `hits`
+  (list of `Hit`), `stats_by_attacker` (dict of `AttackerStats`),
+  `defends_by_pair` (dict of `DefenseStats` keyed by `(attacker,
+  defender)`), `attackers_by_damage()`.
+- **`AttackerStats`** — `damage`, `hits`, `misses`, `crits`, `biggest`,
+  `special_damage`, `special_hits`.
+- **`DefenseStats`** — defender-perspective: `damage_taken`,
+  `hits_landed`, `biggest_taken`, `avoided` (dict keyed by outcome
+  label — see `DEFENSE_OUTCOMES`), `total_avoided`, `total_swings`.
+- **`HealerStats`** — `healing`, `casts`, `crits`, `biggest`,
+  `spell_amount`, `spell_casts`.
+- **`Encounter`** — `encounter_id`, `members` (list of `FightResult`),
+  `name`, `fight_complete`, `heals`, `total_healing`, `start`, `end`,
+  `duration_seconds`, `target_count`. Use `merge_encounter(enc)` to
+  flatten back into one `FightResult` for reuse with the existing
+  reporting helpers.
+- **Events** — `MeleeHit`, `MeleeMiss` (carries `outcome`),
+  `SpellDamage`, `SpellResist`, `HealEvent`, `DeathMessage`,
+  `ZoneEntered`, `UnknownEvent`. `parse_line(line)` is the entry point.
 
 ## Project layout
 
@@ -245,8 +301,9 @@ flurry/
 │   ├── __main__.py           # `python -m flurry` subcommand routing
 │   ├── events.py             # event dataclasses
 │   ├── parser.py             # log line → event
-│   ├── tail.py               # file follower (replay + live)
-│   ├── analyzer.py           # fight analysis (FightResult, Timeline)
+│   ├── tail.py               # file follower + byte-offset slicing
+│   ├── analyzer.py           # fight analysis (FightResult, Encounter, Timeline)
+│   ├── sidecar.py            # per-log persistence: pet owners + manual encounters
 │   ├── report.py             # text + HTML rendering
 │   ├── server.py             # local web UI (stdlib http.server + inline HTML)
 │   └── cli.py                # argparse entry functions
@@ -254,54 +311,53 @@ flurry/
 ├── flurry.sh                 # POSIX launcher
 ├── _pyinstaller_entry.py     # tiny launcher used by the .exe build
 ├── build_exe.py              # `python build_exe.py` -> dist/flurry.exe
-├── tests/
-│   ├── test_parser.py         # parser correctness (13 tests)
-│   ├── test_analyzer.py       # analyzer correctness (10 tests)
-│   └── test_detect_fights.py  # fight auto-detection (11 tests)
+├── tests/                    # 119 tests across 6 files (see Tests section)
 └── pyproject.toml
 ```
 
 ## Tests
 
+Tests are runnable as plain scripts — they import from the source tree
+directly, no pip install needed. Each file has its own `main()` runner
+that prints PASS/FAIL per test:
+
 ```bash
-python tests/test_parser.py          # 13 tests
-python tests/test_analyzer.py        # 10 tests
-python tests/test_detect_fights.py   # 11 tests
+python tests/test_parser.py          # 53 tests — parser correctness
+python tests/test_analyzer.py        # 10 tests — analyze_fight against a real log fixture
+python tests/test_detect_fights.py   # 14 tests — fight auto-detection + defends_by_pair
+python tests/test_overrides.py       # 13 tests — apply_pet_owners + manual encounter groups
+python tests/test_sidecar.py         # 17 tests — sidecar JSON load/save + atomic writes
+python tests/test_tail_window.py     # 13 tests — byte-offset slicing + progress callbacks
 ```
 
-These don't require pip-installing anything — they import from the source
-tree directly.
-
-The analyzer tests use a real raid log as a fixture. They auto-skip if
-the fixture file isn't present. The detect_fights tests synthesize their
-own log content in tempfiles, so they run anywhere.
+The analyzer tests use a real raid log as a fixture and auto-skip if
+the fixture isn't present; the rest synthesize their own log content
+in tempfiles or work entirely off in-memory dataclasses, so they run
+anywhere.
 
 ## Roadmap
 
-The web UI shipped as Pass 1 (navigation only). Plausible next features:
+What's left, in rough order of usefulness:
 
-- **Encounter grouping in the UI** — multi-select fights from the
-  session table, name them, persist to a `<logfile>.flurry.json`
-  sidecar. Lets you group boss + adds (or trash + boss) into one
-  named encounter with merged stats.
-- **Pet ownership in the UI** — click a named pet ("Bonebreaker") and
-  assign it to its owner. Persists in the same sidecar.
-- **Multi-fight session reports** — average DPS per attacker across a
-  raid night, with min/max/median/p95.
-- **Healing and tanking views** — same per-attacker model, but for
-  HPS/damage-mitigated.
-- **Log diffing** — compare the same boss before and after a gear change.
+- **Log diffing** — compare the same boss before and after a gear change
+  ("what did this new weapon actually do?").
 - **JSON export** — `--json` flags on the CLI tools for piping into
-  other tools.
-- **Live tail mode** — watch DPS update in real time as the log grows.
+  other tools. The UI already has its own JSON via `/api/*`.
+- **Live tail mode** — watch DPS / HPS / DTPS update in real time as
+  the log grows. `tail.py` already supports follow-mode; the analyzer
+  and server don't yet.
   - **Player overlay** — a compact, always-on-top window with four
     counters for the active character (damage out, damage in, healing
     out, healing in) so you can glance at your own performance mid-fight
     without alt-tabbing to the full UI.
   - **HP delta indicator** — net HP change over the last second
-    (damage taken + heals received), shown green for gains and red
-    for losses, so you can see trouble coming before the health bar
-    does.
+    (damage taken + heals received), green for gains and red for losses,
+    so you can see trouble coming before the health bar does.
+
+Things that used to be on this list and have shipped — encounter
+grouping, pet ownership, session-summary rollups, healing tab, tanking
+tab with avoidance breakdown, life-delta toggle. See `RELEASES.md` for
+the running history.
 
 ## License
 
