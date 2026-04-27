@@ -1,5 +1,22 @@
 # Releases
 
+## v0.3.1 — Tanking modal fix
+
+Patch on top of v0.3.0. The **Δ Life** mode of the encounter-level
+tanking pair modal showed `0 net life · 0 buckets` regardless of the
+actual numbers. Cause: the modal's `refresh()` reset the subtitle and
+stats from the per-event hits list, which is empty by design in delta
+mode (delta is a derived series with no individual events). The
+informative subtitle the modal had just written got clobbered the
+moment it opened.
+
+Fix: the subtitle is now delta-aware (`X damage taken · Y healing
+received · ±Z net life`) and `refresh()` is skipped entirely for delta
+since there's nothing to filter or window into. The chart math was
+always correct — only the subtitle was misleading.
+
+---
+
 ## v0.3.0 — Tanking views
 
 The big addition is full **tank-side** visibility — what hit you, how

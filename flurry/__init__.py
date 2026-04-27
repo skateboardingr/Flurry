@@ -19,7 +19,7 @@ For HTML output:
         f.write(html_timeline_report(result, timeline))
 """
 
-__version__ = '0.3.0'
+__version__ = '0.3.1'
 
 # Re-export the most useful names so callers can `from flurry import ...`
 from .analyzer import (
