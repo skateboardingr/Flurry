@@ -60,7 +60,10 @@ flurry/
 │   ├── analyzer.py          # FightResult, Timeline; pure data, no I/O
 │   ├── sidecar.py           # per-log persistence: <log>.flurry.json
 │   ├── report.py            # text + HTML rendering
-│   ├── server.py            # local web UI (stdlib http.server + inline HTML)
+│   ├── server.py            # local web UI (stdlib http.server + JSON API)
+│   ├── static/              # front-end assets (HTML/CSS/JS, served from disk)
+│   │   ├── styles.css
+│   │   └── app.js
 │   └── cli.py               # argparse-backed entry functions
 ├── flurry.bat / flurry.sh   # source-tree launchers (wrap `python -m flurry`)
 ├── _pyinstaller_entry.py    # tiny launcher; PyInstaller bundles this
@@ -635,6 +638,43 @@ pattern, think about ordering.
       stay damage-only. Delta mode in the modal hides the by-source
       breakdown and skips the click-to-window UX (no individual events).
 
+### Encounter diff (compare two encounters in the same log)
+- [x] `_diff_payload(encounters, [a_id, b_id])` returns a parallel
+      per-actor row payload over the union of attackers/defenders/
+      healers in both encounters. Side classification (`received >
+      dealt + healed`) is computed across the union so an actor stays
+      on the same side in both columns even if one encounter alone
+      would flip them. Per-actor `values[2]` carries 6 metrics each
+      side: `damage`/`dps`, `damage_taken`/`dtps`, `healing`/`hps`,
+      plus `biggest_*` and a `present` flag distinguishing "zero
+      activity" from "actor missing entirely from this encounter".
+- [x] `GET /api/diff?ids=A,B` — exactly 2 integer ids required (400
+      otherwise); 404 if either id can't be resolved (params shifted
+      since the user picked).
+- [x] `#/diff?ids=A,B` route opened from a **Compare** button in the
+      session-view header. The button is disabled-but-visible until
+      the user ticks exactly 2 encounters — discoverable from empty
+      state, with a title attribute that explains why it's disabled.
+- [x] View has three metric tabs (**Damage** / **Damage taken** /
+      **Healing**) and a display toggle (**Side-by-side** /
+      **Delta**). Side-by-side is two stacked bars per row sharing an
+      x-scale across all visible rows so absolute magnitudes read
+      true. Delta is one centered-on-zero bar per row, colored by
+      *meaning*: for damage and healing a positive delta is green
+      ("better"); for damage taken positive is red ("worse"). The
+      `betterIfHigher` flag on each `DIFF_MODES` entry is the only
+      place this semantic lives, so adding a future mode (e.g.
+      "deaths") just sets the flag.
+- [x] Per-actor checkboxes hide rows the user doesn't care about
+      (e.g. trial-running pets that fired only once); a hidden-row
+      strip at the bottom of the page lists what's hidden with
+      one-click un-hide buttons. State is module-scope so flipping
+      tabs preserves both the hide-set and the chosen display mode.
+- [x] **Same-log only.** Cross-log diffing (the actually-useful
+      "before/after gear change across raid nights" case) needs the
+      server to track multiple loaded logs simultaneously plus a UI
+      to pick the second log; explicitly punted to the next pass.
+
 ### Sidecar / user overrides (`flurry/sidecar.py`)
 - [x] `<logfile>.flurry.json` next to each log holds two kinds of edits:
       pet-owner assignments (`{actor: owner}`) and manual encounter
@@ -678,6 +718,16 @@ pattern, think about ordering.
 - [x] `pyproject.toml`, installs cleanly with `pip install -e .`
 - [x] Zero runtime dependencies (pure stdlib)
 - [x] CLIs registered as console_scripts
+- [x] Front-end split into `flurry/static/{styles.css,app.js}` (was a
+      single 4,000-line HTML triple-string inside `server.py`). Served
+      via a `/static/<name>` route + `importlib.resources.files()`,
+      which works the same way in source-tree, `pip install`, and
+      PyInstaller `--onefile` (the bundle ships the dir via
+      `--add-data flurry/static`). `pyproject.toml` declares
+      `flurry = ["static/*"]` under `tool.setuptools.package-data` so
+      `pip install` picks the assets up. server.py dropped from 5,750
+      → 1,800 lines of clean Python; the JS now gets editor support
+      (syntax highlighting, separate linting, sensible grep).
 
 ### Tests
 - [x] 29 parser tests (regex correctness against real log lines)
@@ -767,11 +817,21 @@ should look like:
   root is detected by `os.path.dirname(p) == p` and renders without
   a parent link.
 
-- **Hash-routed SPA, plain vanilla JS.** No framework. Three views
-  switched by `location.hash`: `#/` (session list), `#/picker` (file
-  picker), `#/fight/<id>` (fight detail). The whole front-end is one
-  HTML constant in `server.py` to keep packaging trivial. We can
-  extract to `flurry/static/` if the file gets unwieldy.
+- **Hash-routed SPA, plain vanilla JS.** No framework. Views switched
+  by `location.hash`: `#/` (session list), `#/picker` (file picker),
+  `#/encounter/<id>` (encounter detail), `#/session-summary` (multi-fight
+  rollup), `#/diff` (two-encounter compare), `#/debug` (parser coverage).
+  The front-end lives as files under `flurry/static/` (`index.html`,
+  `styles.css`, `app.js`) and is served by a `/static/<name>` route via
+  `importlib.resources.files('flurry') / 'static'`. The same path
+  resolves in source-tree mode, after `pip install`, AND inside the
+  PyInstaller `--onefile` bundle (extracted to `_MEIPASS` at startup),
+  because `build_exe.py` ships the dir via `--add-data flurry/static`.
+  Edits to `app.js` / `styles.css` show up on a plain browser refresh —
+  no Python restart needed (server replies with `Cache-Control: no-cache`).
+  This used to be one giant HTML string constant in `server.py`; the
+  split happened once the embedded JS crossed ~3,400 lines and the
+  Python file crossed 5,700 lines.
 
 - **JSON shapes mirror the existing text/HTML reports.** `_fight_summary`
   and `_fight_detail` produce the same numbers as `text_dps_report` and

@@ -1,5 +1,82 @@
 # Releases
 
+## v0.4.0 — Encounter diff + front-end split
+
+The headline addition is **encounter diffing** — pick two encounters
+from the same log and compare them side-by-side. Built to answer the
+"did this gear change actually do anything?" question that was driving
+the roadmap. Same-log only this release; cross-log diff is the next
+slice once the server learns to hold more than one log at a time.
+
+### Encounter diff
+
+Tick exactly two rows in the session list and the action bar gains a
+**Compare** button (next to Merge / Split / Clear). Click it to open
+the diff view, which shows:
+
+- **Two encounter cards** at the top — name, start time, duration,
+  killed/incomplete status, total damage, raid DPS, total healing.
+- **Headline delta strip** — Δ duration, Δ total damage, Δ raid DPS,
+  Δ total healing — colored by *meaning*: faster duration is green
+  (improvement) even though the delta is negative; total damage up is
+  green; damage taken up is red; etc.
+- **Three metric tabs** — **Damage** / **Damage taken** / **Healing**.
+  Each rolls up the union of actors across both encounters with a
+  per-encounter value and a delta.
+- **Display toggle** — **Side-by-side** (two stacked bars per row,
+  encounter A blue / encounter B green, shared x-scale across all
+  visible rows so absolute magnitudes read true) or **Delta** (one
+  centered-on-zero bar per row, colored by meaning, scaled to max abs
+  delta).
+- **Per-actor checkboxes** to hide noise, with a hidden-row strip at
+  the bottom for one-click un-hide. State persists across tab and
+  display switches so flipping between Damage and Healing keeps your
+  filtered view.
+
+Side classification (friendly vs enemy) is computed across the union
+of both encounters using the same `received > dealt + healed` rule the
+encounter detail and session summary use, so an actor stays on the
+same side in both columns even if one encounter alone would flip them.
+
+### Scroll-locked session view
+
+The session list now uses a viewport-bounded layout: the page header,
+summary stats, params panel, and action bar stay pinned while only
+the encounter table scrolls. The table's column headers are sticky
+inside that scroll region so they stay visible as you page through
+long sessions. Other views (encounter detail, session summary, diff,
+debug) keep normal page scroll — the lock is scoped to the session
+view via a body class toggled by the router.
+
+### Compare lives in the action bar
+
+The Compare button used to live next to Session summary in the page
+header, disabled-but-visible when nothing was selected. It moved into
+the action bar alongside Merge / Split / Clear since it's strictly a
+two-selection action with no whole-log mode like Session summary has
+(Session summary works at any selection count and stays in the
+header). Net: the header stays clean when nothing is ticked, and
+Compare appears the moment you start acting on selection.
+
+### Front-end extracted to `flurry/static/`
+
+The HTML/CSS/JS for the web UI used to be one ~4,000-line triple-string
+constant inside `server.py`. It's now `flurry/static/styles.css` and
+`flurry/static/app.js`, served by a `/static/<name>` route that uses
+`importlib.resources.files('flurry') / 'static'` to resolve files —
+which works the same way in source-tree, `pip install`, and inside
+the PyInstaller `--onefile` bundle (the build ships the dir via
+`--add-data flurry/static`).
+
+Net effect for users: nothing visible. For contributors: `app.js` and
+`styles.css` get proper editor support (syntax highlighting, separate
+linting, sensible grep), and edits to either show up on a plain
+browser refresh — no Python restart needed (server replies with
+`Cache-Control: no-cache`). `server.py` dropped from 5,750 → ~1,800
+lines of clean Python.
+
+---
+
 ## v0.3.1 — Tanking modal fix
 
 Patch on top of v0.3.0. The **Δ Life** mode of the encounter-level

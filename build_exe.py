@@ -68,6 +68,15 @@ def main():
         '--distpath', os.path.join(REPO_ROOT, 'dist'),
         '--workpath', os.path.join(REPO_ROOT, 'build'),
         '--specpath', os.path.join(REPO_ROOT, 'build'),
+        # Ship the front-end static assets (HTML linked to /static/app.js
+        # + /static/styles.css) inside the bundle. PyInstaller's --onefile
+        # bootloader extracts these to sys._MEIPASS at startup; the server
+        # uses importlib.resources.files('flurry') / 'static' to resolve
+        # them, which works the same in source-tree and frozen modes.
+        # `os.pathsep` is `;` on Windows / `:` elsewhere — PyInstaller's
+        # --add-data syntax is `<src><sep><dest_in_bundle>`.
+        '--add-data',
+        f'{os.path.join(REPO_ROOT, "flurry", "static")}{os.pathsep}flurry/static',
         # Entry point is a tiny launcher that imports flurry as a package
         # and calls its main(). Bundling flurry/__main__.py directly would
         # turn it into a top-level script and break its relative imports.

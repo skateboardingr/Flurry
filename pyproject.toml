@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flurry"
-version = "0.3.1"
+version = "0.4.0"
 description = "EverQuest combat log analyzer"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -37,6 +37,12 @@ build = ["pyinstaller>=6.0"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["flurry*"]
+
+# Ship the front-end assets (HTML linked to /static/app.js + /static/styles.css)
+# as package data so they're picked up by `pip install` and resolved at runtime
+# via importlib.resources.files('flurry') / 'static' / <name>.
+[tool.setuptools.package-data]
+flurry = ["static/*"]
 
 # Disable pytest's cache provider on this repo. The repo lives on a
 # network drive (Z:) where pytest's cache-dir lock dance fails with

@@ -1,0 +1,639 @@
+  :root {
+    --bg: #0f1419;
+    --panel: #1a2030;
+    --row: #1e2536;
+    --row-hover: #263048;
+    --border: #2a3142;
+    --text: #e5e7eb;
+    --text-dim: #94a3b8;
+    --text-bright: #f8fafc;
+    --accent: #60a5fa;
+    --good: #34d399;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg); color: var(--text);
+    margin: 0; padding: 24px;
+    max-width: 1200px; margin: 0 auto;
+  }
+  header { margin-bottom: 20px; }
+
+  /* Session view: lock the page header, summary, params, and action bar
+     to the top of the viewport so the encounter table is the only thing
+     that scrolls. Toggled by the router (route() in app.js) — the class
+     is set on entry to renderSession and cleared on every other route so
+     the lock doesn't bleed into the encounter detail / session summary /
+     diff / debug views, where normal page scroll is what you want.
+
+     Layout: body becomes a 100vh flex column. The page header is
+     auto-sized; <main id="app"> claims the rest with min-height:0 so
+     its overflowing child can scroll cleanly (without min-height:0,
+     flex children refuse to shrink below their content size and the
+     "internal scroll" never engages). #fight-table-panel is the one
+     panel that gets flex:1 + overflow-y:auto; the summary and params
+     panels above it stay flex:0 0 auto. The action-bar slot sits
+     between params and the table and stays in the static region too,
+     so Merge/Split/Clear are always reachable while you scroll. */
+  body.session-locked { height: 100vh; max-height: 100vh;
+                        overflow: hidden;
+                        display: flex; flex-direction: column; }
+  body.session-locked > header { flex: 0 0 auto; margin-bottom: 12px; }
+  body.session-locked > main { flex: 1 1 auto; min-height: 0;
+                                display: flex; flex-direction: column;
+                                gap: 12px; }
+  body.session-locked > main > .panel { flex: 0 0 auto; }
+  body.session-locked > main > #action-bar-slot { flex: 0 0 auto; }
+  body.session-locked > main > #fight-table-panel {
+    flex: 1 1 auto; overflow-y: auto; min-height: 120px;
+    /* Drop the panel's top padding so the table butts up against the
+       panel's top edge. With the default 20px padding-top, scrolled rows
+       remain visible in the padding-top area ABOVE the sticky thead
+       (browsers render scrollable overflow through the padding region),
+       which is the "text shows through at the top" bug. The table's own
+       th padding still gives the header row vertical breathing room.
+       Horizontal + bottom padding stay so the table doesn't touch the
+       side/bottom edges of the panel. */
+    padding-top: 0;
+  }
+  /* Sticky thead inside the scrolling table panel — keep the column
+     headers in view as the user scrolls through long sessions.
+     background must be set or the rows scrolling underneath ghost
+     through the transparent th cells. z-index keeps the header above
+     any per-row hover styles that might create their own stacking. */
+  body.session-locked #fight-table-panel thead th {
+    position: sticky; top: 0; background: var(--panel); z-index: 2;
+    box-shadow: 0 1px 0 var(--border);
+  }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; color: var(--text-bright); }
+  h1 .brand { color: var(--accent); font-weight: 700; }
+  h1 .sep { color: var(--border); margin: 0 8px; }
+  .sub { color: var(--text-dim); font-size: 0.9rem; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .back { font-size: 0.9rem; margin-bottom: 12px; display: inline-block; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--text-dim); font-weight: 600; font-size: 0.8rem;
+       text-transform: uppercase; letter-spacing: 0.04em; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.fight-row { cursor: pointer; }
+  tr.fight-row:hover td { background: var(--row-hover); }
+  td.target { font-weight: 600; color: var(--text-bright); }
+  td.status { font-size: 0.85rem; }
+  .status.killed { color: var(--good); }
+  .status.incomplete { color: var(--warn); }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--text-bright); }
+  .sort-arrow { color: var(--accent); margin-left: 4px; }
+
+  /* Tunable-parameters panel */
+  .params-help { margin-bottom: 12px; font-size: 0.8rem;
+                 color: var(--text-dim); line-height: 1.45; }
+  .params-help strong { color: var(--text-bright); font-weight: 600; }
+  .params-row { display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap; }
+  .params-row label { display: flex; flex-direction: column; gap: 4px;
+                      font-size: 0.75rem; color: var(--text-dim);
+                      text-transform: uppercase; letter-spacing: 0.04em; }
+  .params-row input[type="number"] {
+                      background: var(--row); color: var(--text);
+                      border: 1px solid var(--border); padding: 6px 10px;
+                      border-radius: 4px; font-size: 0.9rem; width: 110px;
+                      font-variant-numeric: tabular-nums; font-family: inherit; }
+  .params-row input:focus { outline: none; border-color: var(--accent); }
+  .params-row .err-msg { color: var(--bad); font-size: 0.85rem;
+                         align-self: center; margin-left: 8px; }
+  .params-row label.check { flex-direction: row; align-items: center;
+                            gap: 6px; padding-bottom: 8px;
+                            text-transform: none; letter-spacing: 0;
+                            font-size: 0.85rem; color: var(--text); }
+  .params-row label.check input { accent-color: var(--accent); }
+
+  /* Expandable per-attacker rows */
+  tr.attacker-row { cursor: pointer; }
+  tr.attacker-row:hover td { background: var(--row-hover); }
+  tr.attacker-row .expand { display: inline-block; color: var(--text-dim);
+                            transition: transform 0.15s; margin-right: 6px;
+                            font-size: 0.7rem; vertical-align: middle;
+                            width: 0.8rem; }
+  tr.attacker-row.expanded .expand { transform: rotate(90deg); }
+  tr.attacker-detail > td { padding: 14px 20px; background: var(--bg);
+                            border-bottom: 1px solid var(--border); }
+  .breakdown { display: grid;
+               grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+               gap: 24px; }
+  .breakdown h4 { color: var(--text-dim); font-size: 0.72rem;
+                  text-transform: uppercase; letter-spacing: 0.06em;
+                  margin: 0 0 8px; }
+  .breakdown table { width: 100%; }
+  .breakdown table th, .breakdown table td {
+    padding: 4px 8px; font-size: 0.85rem; }
+  .breakdown .empty { color: var(--text-dim); font-size: 0.85rem;
+                      padding: 4px 0; }
+  tr.pair-row { cursor: pointer; }
+  tr.pair-row:hover td { background: var(--row-hover); }
+  tr.pair-row td:first-child { color: var(--accent); }
+  /* Synthetic "All" row at the top of each breakdown table — sums the
+     other rows. Subtle accent stripe so it reads as a rollup, not just
+     another target. */
+  tr.pair-row-all td { background: rgba(96, 165, 250, 0.08);
+                       border-top: 1px solid var(--border);
+                       border-bottom: 1px solid var(--border); }
+  tr.pair-row-all:hover td { background: rgba(96, 165, 250, 0.16); }
+  tr.pair-row-all td:first-child { color: var(--text-bright); }
+
+  /* Tanking table — denser cells than the damage tables because 12
+     columns get cramped at the default padding. */
+  .tanking-table th, .tanking-table td,
+  .tanking-breakdown th, .tanking-breakdown td {
+    padding: 6px 10px; font-size: 0.85rem;
+  }
+  .tanking-table th.num, .tanking-breakdown th.num { font-size: 0.75rem; }
+
+  /* Pair-detail modal */
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.65);
+                    display: flex; align-items: center; justify-content: center;
+                    z-index: 1000; }
+  .modal { background: var(--panel); border: 1px solid var(--border);
+           border-radius: 8px; padding: 24px 24px 28px;
+           max-width: 900px; width: 92%; max-height: 85vh;
+           overflow: auto; position: relative; }
+  .modal h3 { margin: 0 0 4px; color: var(--text-bright); font-size: 1.05rem; }
+  .modal .modal-sub { color: var(--text-dim); font-size: 0.85rem;
+                      margin-bottom: 16px; }
+  .modal-close { position: absolute; top: 8px; right: 12px;
+                 background: transparent; border: none; color: var(--text-dim);
+                 font-size: 1.6rem; line-height: 1; cursor: pointer;
+                 padding: 4px 10px; font-family: inherit; }
+  .modal-close:hover { color: var(--text-bright); }
+
+  /* Pair-modal layout: chart + stats + hits on the left, source
+     breakdown on the right. Stack the columns when narrow. */
+  .modal.pair-modal { max-width: 1100px; }
+  /* Delta mode hides the source-breakdown column; let the chart take
+     the full width. */
+  .modal.pair-modal.no-source-panel .pair-body {
+    grid-template-columns: 1fr;
+  }
+  /* Header row with title + (optional) damage/healing/delta toggle.
+     padding-right on the row itself reserves space for the absolutely-
+     positioned modal-close (×) button so the toggle group doesn't slide
+     under it on narrower viewports. */
+  .pair-modal-head { display: flex; align-items: flex-start;
+                     justify-content: space-between; gap: 16px;
+                     margin-bottom: 4px; padding-right: 36px; }
+  .pair-metric-toggle { display: inline-flex; gap: 0;
+                        border: 1px solid var(--border); border-radius: 6px;
+                        overflow: hidden; flex-shrink: 0; }
+  .pair-body { display: grid; grid-template-columns: 1fr 260px;
+               gap: 20px; margin-top: 14px; align-items: start; }
+  @media (max-width: 800px) { .pair-body { grid-template-columns: 1fr; } }
+  .pair-stats { display: flex; flex-wrap: wrap; gap: 18px;
+                margin-top: 14px; padding: 10px 14px;
+                background: var(--row); border-radius: 6px;
+                font-size: 0.85rem; color: var(--text-dim); }
+  .pair-stats strong { color: var(--text); font-weight: 600; }
+  .pair-hits-help { margin-top: 12px; font-size: 0.8rem; }
+  /* Anchor the Clear button to the bottom-left corner of the chart
+     canvas — visually below the y-axis 0 tick and left of the first
+     x-axis label. */
+  .pair-chart-wrap { position: relative; }
+  .pair-clear-btn { position: absolute; left: 0; bottom: 0;
+                    padding: 2px 10px; font-size: 0.75rem;
+                    background: transparent; color: var(--text-dim);
+                    border: 1px solid var(--border); border-radius: 4px;
+                    cursor: pointer; font-family: inherit; z-index: 2; }
+  .pair-clear-btn:hover { color: var(--text-bright);
+                          border-color: var(--text-dim); }
+  .pair-hits-heading { color: var(--text-bright); font-size: 0.9rem;
+                       margin: 16px 0 8px; }
+  .pair-hits-table { width: 100%; font-size: 0.85rem; }
+  .pair-hits-table th, .pair-hits-table td { padding: 4px 8px;
+                                              border-bottom: 1px solid var(--border); }
+  .pair-hits-table th { color: var(--text-dim); font-weight: 600;
+                        font-size: 0.75rem; text-transform: uppercase;
+                        letter-spacing: 0.04em; text-align: left; }
+  .pair-hits-table td.num, .pair-hits-table th.num { text-align: right; }
+  /* Inner per-source detail table revealed when a source row is expanded.
+     Slightly tighter than the outer table to read as a sub-list. */
+  .pair-hits-detail-table { width: 100%; font-size: 0.8rem;
+                            border-collapse: collapse; }
+  .pair-hits-detail-table th, .pair-hits-detail-table td { padding: 3px 8px;
+                                                            border-bottom: 1px solid var(--border); }
+  .pair-hits-detail-table th { color: var(--text-dim); font-weight: 600;
+                                font-size: 0.7rem; text-transform: uppercase;
+                                letter-spacing: 0.04em; text-align: left; }
+  .pair-hits-detail-table td.num, .pair-hits-detail-table th.num { text-align: right; }
+
+  .source-breakdown { width: 100%; font-size: 0.85rem;
+                      border-collapse: collapse; }
+  .source-breakdown caption { color: var(--text-dim); font-size: 0.72rem;
+                              text-transform: uppercase; letter-spacing: 0.06em;
+                              text-align: left; padding: 0 0 8px; }
+  .source-breakdown th { color: var(--text-dim); font-weight: 600;
+                         font-size: 0.7rem; text-transform: uppercase;
+                         letter-spacing: 0.04em; padding: 4px 8px;
+                         text-align: left; }
+  .source-breakdown td { padding: 4px 8px;
+                         border-bottom: 1px solid var(--border); }
+  .source-breakdown td.num, .source-breakdown th.num { text-align: right; }
+  .source-row { cursor: pointer; }
+  .source-row:hover td { background: var(--row-hover); }
+  .source-row.active td { background: var(--row); color: var(--accent);
+                          font-weight: 600; }
+
+  /* Manual-encounter pin badge in the session table */
+  .pin-badge { display: inline-block; margin-left: 6px;
+               padding: 1px 6px; border-radius: 3px;
+               font-size: 0.65rem; font-weight: 700; letter-spacing: 0.04em;
+               text-transform: uppercase;
+               background: rgba(96, 165, 250, 0.18); color: var(--accent); }
+
+  /* Selection action bar above the session table. Only rendered when at
+     least one encounter row is selected; the buttons themselves disable
+     based on minimum-count rules (merge needs 2+, etc.). */
+  .action-bar { display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+                margin-bottom: 12px; background: var(--row);
+                border: 1px solid var(--border); border-radius: 6px;
+                font-size: 0.9rem; }
+  .action-bar .count { color: var(--text-bright); font-weight: 600;
+                       margin-right: auto; }
+  .action-bar .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .action-bar .help { color: var(--text-dim); font-size: 0.8rem; }
+
+  /* Per-row checkbox column. The label fills the whole cell so anywhere
+     in the cell area is a click target, not just the tiny native widget.
+     Padding 0 on the cell + display:flex on the label expands the hit
+     box to ~28px × full row height. */
+  .check-cell { width: 36px; padding: 0; }
+  .check-cell label.check-hit { display: flex; align-items: center;
+                                justify-content: center;
+                                width: 100%; height: 100%;
+                                padding: 8px 10px; cursor: pointer;
+                                margin: 0; }
+  .check-cell input[type="checkbox"] { accent-color: var(--accent);
+                                       cursor: pointer; pointer-events: none; }
+
+  /* Pet-owner edit modal */
+  .modal.pets-modal { max-width: 720px; }
+  /* Header-action row hosts the [Save] [×] pair top-right. The close
+     button keeps its existing static styling (font-size, color); we
+     just override its absolute positioning so it lays out as a sibling
+     of Save inside the flex container. */
+  .pets-modal-actions { position: absolute; top: 8px; right: 12px;
+                        display: flex; gap: 8px; align-items: center; }
+  .pets-modal-actions .modal-close { position: static; top: auto;
+                                     right: auto; }
+  .pets-help { color: var(--text-dim); font-size: 0.85rem;
+               line-height: 1.5; margin-bottom: 16px; }
+  .pets-help code { background: var(--row); padding: 1px 6px;
+                    border-radius: 3px; font-size: 0.85em; }
+  .pets-table { width: 100%; font-size: 0.9rem;
+                border-collapse: collapse; }
+  .pets-table th { color: var(--text-dim); font-weight: 600;
+                   font-size: 0.72rem; text-transform: uppercase;
+                   letter-spacing: 0.04em; padding: 6px 8px;
+                   text-align: left; border-bottom: 1px solid var(--border); }
+  .pets-table td { padding: 8px; border-bottom: 1px solid var(--border); }
+  .pets-table td.num { text-align: right;
+                       font-variant-numeric: tabular-nums; }
+  .pets-table .actor { color: var(--text-bright); }
+  .pets-table .owner-input { background: var(--row); color: var(--text);
+                             border: 1px solid var(--border);
+                             padding: 4px 8px; border-radius: 4px;
+                             font-family: inherit; font-size: 0.9rem;
+                             width: 100%; }
+  .pets-table .owner-input:focus { outline: none;
+                                   border-color: var(--accent); }
+  .pets-table .side-tag { display: inline-block; margin-left: 6px;
+                          padding: 1px 6px; border-radius: 3px;
+                          font-size: 0.65rem; font-weight: 700;
+                          letter-spacing: 0.04em; text-transform: uppercase;
+                          vertical-align: middle; }
+  .pets-table .side-tag.friendly { background: rgba(52, 211, 153, 0.18);
+                                   color: var(--good); }
+  .pets-table .side-tag.enemy { background: rgba(248, 113, 113, 0.18);
+                                color: var(--bad); }
+  .pets-table .row-actions { white-space: nowrap; text-align: right; }
+  .pets-table .row-actions .btn { font-size: 0.8rem;
+                                  padding: 4px 10px; margin-left: 4px; }
+  .pets-current-list { margin-top: 16px; font-size: 0.85rem; }
+  .pets-current-list .sub { color: var(--text-dim); }
+
+  /* Session-summary view: charts stacked on the left, rollup table on
+     the right. Stack everything into a single column on narrow screens
+     so the heatmap stays usable. `align-items: start` so each column
+     sizes to its own content — without it, the grid stretches both
+     columns to the row height (set by whichever side is taller),
+     leaving the panel BG ending mid-table on the shorter side. */
+  .ss-grid { display: grid;
+             grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+             gap: 16px; margin-bottom: 20px; align-items: start; }
+  .ss-charts { display: flex; flex-direction: column; gap: 16px;
+               min-width: 0; }
+  .ss-table-col { display: flex; flex-direction: column; gap: 16px;
+                  min-width: 0; }
+  @media (max-width: 1100px) { .ss-grid { grid-template-columns: 1fr; } }
+  .ss-section-h { color: var(--text-bright); font-size: 1rem;
+                  margin: 0 0 12px; font-weight: 600; }
+  .ss-section-h .sub { color: var(--text-dim); font-weight: 400;
+                       font-size: 0.85rem; margin-left: 6px; }
+
+  /* Tanking sub-metric toggle (damage / healing / delta), shown beside
+     the chart heading when the Tanking tab is active. */
+  .ss-chart-head { display: flex; align-items: baseline;
+                   justify-content: space-between; gap: 12px;
+                   margin-bottom: 12px; flex-wrap: wrap; }
+  .ss-chart-head .ss-section-h { margin: 0; }
+  .ss-metric-toggle { display: inline-flex; gap: 0;
+                      border: 1px solid var(--border); border-radius: 6px;
+                      overflow: hidden; }
+  .ss-metric-btn { background: transparent; border: 0;
+                   border-right: 1px solid var(--border);
+                   color: var(--text-dim); font-family: inherit;
+                   font-size: 0.8rem; padding: 4px 12px; cursor: pointer; }
+  .ss-metric-btn:last-child { border-right: 0; }
+  .ss-metric-btn:hover { background: var(--row-hover);
+                         color: var(--text-bright); }
+  .ss-metric-btn.active { background: var(--accent); color: #fff; }
+
+  /* Rollup table — narrower text, fewer fences so it fits in the right
+     column without wrapping the numeric columns. The 8-column table
+     can have a min-content width wider than the right grid column on
+     narrow viewports / with long attacker names; the wrapper provides
+     horizontal scroll instead of bleeding past the panel BG. */
+  .ss-table-wrap { overflow-x: auto; }
+  table.ss-table { width: 100%; border-collapse: separate;
+                   border-spacing: 0; font-size: 0.85rem; }
+  table.ss-table th, table.ss-table td { padding: 6px 8px;
+                                          border-bottom: 1px solid var(--border); }
+  table.ss-table th { color: var(--text-dim); font-weight: 600;
+                      font-size: 0.72rem; text-transform: uppercase;
+                      letter-spacing: 0.04em; text-align: left; }
+  table.ss-table td.num, table.ss-table th.num { text-align: right;
+                                                  font-variant-numeric: tabular-nums; }
+  table.ss-table td.target { color: var(--text-bright); font-weight: 600; }
+  /* Lock the Attacker column when the wrapper scrolls horizontally so
+     the player name stays in view as the user reads across to the
+     stats columns. Background matches the panel so scrolled content
+     passes behind cleanly; the right-edge shadow distinguishes the
+     pinned column from the rest. border-collapse must be `separate`
+     for sticky borders to render properly — collapsed borders detach
+     from sticky cells and ghost in place during scroll. */
+  table.ss-table th:first-child,
+  table.ss-table td:first-child { position: sticky; left: 0;
+                                  background: var(--panel); z-index: 1;
+                                  box-shadow: 1px 0 0 var(--border); }
+
+  /* Heatmap — cells color-shaded by DPS magnitude. Sticky row/column
+     headers so a wide grid stays navigable. Horizontal scroll wrapper
+     keeps the rest of the layout from blowing up on raids with lots of
+     encounters. */
+  .ss-heatmap-wrap { overflow-x: auto; max-height: 60vh; }
+  table.ss-heatmap { border-collapse: collapse; font-size: 0.75rem;
+                     font-variant-numeric: tabular-nums; }
+  table.ss-heatmap th, table.ss-heatmap td { padding: 4px 6px;
+                                              border: 1px solid var(--border);
+                                              text-align: center;
+                                              white-space: nowrap; }
+  th.ss-heatmap-col-h { color: var(--text-dim); font-size: 0.7rem;
+                        background: var(--panel); position: sticky;
+                        top: 0; z-index: 1; }
+  th.ss-heatmap-row-h { color: var(--text-bright); font-size: 0.75rem;
+                        text-align: left; padding-right: 10px;
+                        background: var(--panel); position: sticky;
+                        left: 0; z-index: 1; max-width: 160px;
+                        overflow: hidden; text-overflow: ellipsis; }
+  td.ss-heatmap-cell { color: #0f1419; font-weight: 600; cursor: pointer; }
+  td.ss-heatmap-cell:hover { outline: 2px solid var(--accent);
+                             outline-offset: -2px; }
+  td.ss-heatmap-empty { color: var(--border); cursor: pointer;
+                        background: transparent; }
+  td.ss-heatmap-empty:hover { background: var(--row-hover); }
+
+  /* Diff view (two-encounter compare) */
+  .diff-enc-grid { display: grid; grid-template-columns: 1fr 1fr;
+                   gap: 16px; margin-bottom: 16px; }
+  @media (max-width: 800px) { .diff-enc-grid { grid-template-columns: 1fr; } }
+  .diff-enc-card { background: var(--row); border: 1px solid var(--border);
+                   border-radius: 6px; padding: 12px 14px; }
+  .diff-enc-card.a { border-left: 3px solid var(--accent); }
+  .diff-enc-card.b { border-left: 3px solid var(--good); }
+  .diff-enc-label { color: var(--text-dim); font-size: 0.72rem;
+                    text-transform: uppercase; letter-spacing: 0.06em;
+                    margin-bottom: 4px; font-weight: 600; }
+  .diff-enc-name { color: var(--text-bright); font-weight: 600;
+                   font-size: 1rem; margin-bottom: 6px; }
+  .diff-enc-meta { display: flex; gap: 12px; flex-wrap: wrap;
+                   font-size: 0.85rem; color: var(--text-dim);
+                   margin-bottom: 8px; }
+  .diff-enc-meta .ok { color: var(--good); font-weight: 600; }
+  .diff-enc-meta .warn { color: var(--warn); font-weight: 600; }
+  .diff-enc-stats { display: flex; gap: 18px; flex-wrap: wrap;
+                    font-size: 0.9rem; color: var(--text); }
+  .diff-enc-stats .sub { font-size: 0.75rem; margin-right: 4px; }
+
+  .diff-headline { display: flex; flex-wrap: wrap; gap: 18px;
+                   padding: 10px 0 0; border-top: 1px solid var(--border);
+                   margin-top: 12px; }
+  .diff-headline-stat { font-size: 0.95rem;
+                        font-variant-numeric: tabular-nums; }
+  .diff-headline-stat .sub { display: inline-block; margin-right: 6px;
+                              font-size: 0.75rem; }
+  .diff-headline-stat .better { color: var(--good); font-weight: 600; }
+  .diff-headline-stat .worse  { color: var(--bad);  font-weight: 600; }
+  .diff-headline-stat .flat   { color: var(--text-dim); font-weight: 500; }
+
+  .diff-display-toggle { display: inline-flex; gap: 0;
+                         border: 1px solid var(--border); border-radius: 6px;
+                         overflow: hidden; }
+
+  /* Diff table — actor checkbox + name + per-encounter cells + delta cell
+     + bar visualization. Bars take whatever width's left after the
+     numeric columns settle. */
+  table.diff-table { width: 100%; border-collapse: separate;
+                     border-spacing: 0; font-size: 0.88rem;
+                     font-variant-numeric: tabular-nums; }
+  table.diff-table th, table.diff-table td { padding: 8px 10px;
+                                              border-bottom: 1px solid var(--border);
+                                              vertical-align: middle; }
+  table.diff-table th { color: var(--text-dim); font-weight: 600;
+                        font-size: 0.72rem; text-transform: uppercase;
+                        letter-spacing: 0.04em; text-align: left; }
+  table.diff-table td.num, table.diff-table th.num { text-align: right; }
+  table.diff-table td.diff-name { color: var(--text-bright); font-weight: 600; }
+  table.diff-table tr.diff-row.hidden-row td { opacity: 0.45; }
+  table.diff-table .diff-name .badge.enemy {
+    display: inline-block; font-size: 0.65rem; padding: 1px 6px;
+    border: 1px solid var(--bad); color: var(--bad);
+    border-radius: 3px; margin-left: 6px; vertical-align: middle;
+    text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+  td.diff-bars { width: 40%; min-width: 220px; }
+  td.diff-delta.better { color: var(--good); }
+  td.diff-delta.worse  { color: var(--bad); }
+  td.diff-delta.flat   { color: var(--text-dim); }
+  td.diff-val-a { color: var(--accent); }
+  td.diff-val-b { color: var(--good); }
+  td.diff-val-a .sub, td.diff-val-b .sub { color: var(--text-dim); }
+
+  /* Side-by-side: two stacked bars. Each row's fill is colored by which
+     encounter it's from (A=accent blue, B=good green) and the absolute
+     value label rides on the bar. */
+  .diff-bar-side { display: flex; flex-direction: column; gap: 4px; }
+  .diff-bar-row { position: relative; height: 18px;
+                  background: var(--row); border-radius: 3px;
+                  overflow: hidden; }
+  .diff-bar-row .diff-bar-fill { height: 100%;
+                                  transition: width 0.15s linear; }
+  .diff-bar-row.a .diff-bar-fill { background: var(--accent); opacity: 0.55; }
+  .diff-bar-row.b .diff-bar-fill { background: var(--good);   opacity: 0.55; }
+  .diff-bar-row .diff-bar-label { position: absolute; left: 8px;
+                                   top: 50%; transform: translateY(-50%);
+                                   font-size: 0.72rem; color: var(--text-bright);
+                                   white-space: nowrap;
+                                   text-shadow: 0 0 2px rgba(0,0,0,0.6); }
+
+  /* Delta: one bar centered on a vertical zero line. Left half holds
+     negative deltas, right half positive. Color by *meaning* — the JS
+     decides better/worse based on metric semantics (damage taken: more
+     is worse) and applies .better (green) / .worse (red) accordingly. */
+  .diff-bar-delta { position: relative; display: flex;
+                    align-items: stretch; height: 22px;
+                    background: var(--row); border-radius: 3px;
+                    overflow: hidden; }
+  .diff-bar-half { flex: 1 1 50%; position: relative; }
+  .diff-bar-half.left  { display: flex; justify-content: flex-end; }
+  .diff-bar-half.right { display: flex; justify-content: flex-start; }
+  .diff-bar-zero { width: 1px; background: var(--border); }
+  .diff-bar-delta .diff-bar-fill { height: 100%; align-self: stretch; }
+  .diff-bar-delta .diff-bar-fill.better { background: var(--good); opacity: 0.7; }
+  .diff-bar-delta .diff-bar-fill.worse  { background: var(--bad);  opacity: 0.7; }
+  .diff-bar-delta .diff-bar-fill.flat   { background: var(--border); }
+
+  .diff-hidden-strip { display: flex; flex-wrap: wrap; gap: 6px;
+                       align-items: center; }
+  .diff-unhide { background: var(--row); border: 1px solid var(--border);
+                 color: var(--text); font-family: inherit; font-size: 0.8rem;
+                 padding: 4px 10px; border-radius: 4px; cursor: pointer; }
+  .diff-unhide:hover { border-color: var(--accent);
+                       color: var(--text-bright); }
+  .diff-unhide-all { margin-left: auto; }
+
+  /* Damage/Healing tabs above encounter detail content */
+  .tabs { display: flex; gap: 4px; margin: 8px 0 16px;
+          border-bottom: 1px solid var(--border); }
+  .tabs .tab { background: transparent; border: none; color: var(--text-dim);
+               padding: 10px 18px; cursor: pointer; font-family: inherit;
+               font-size: 0.9rem; border-bottom: 2px solid transparent;
+               margin-bottom: -1px; transition: color 0.1s, border-color 0.1s; }
+  .tabs .tab:hover { color: var(--text); }
+  .tabs .tab.active { color: var(--text-bright); border-bottom-color: var(--accent); }
+
+  /* Drop-anywhere overlay shown while a file is dragged over the page */
+  /* Upload progress UI shown while bytes stream to /api/upload and the
+     server parses the log. The bar fills 0–100% during the byte transfer,
+     then the label flips to "Parsing log…" while we wait on the response. */
+  .upload-status { max-width: 480px; margin: 24px auto; padding: 20px;
+                   background: var(--panel); border: 1px solid var(--border);
+                   border-radius: 8px; }
+  .upload-label { color: var(--text); margin-bottom: 12px; font-size: 0.95rem; }
+  .upload-label strong { color: var(--text-bright); }
+  .progress-track { width: 100%; height: 8px; background: var(--row);
+                    border-radius: 4px; overflow: hidden; }
+  .progress-fill { height: 100%; background: var(--accent);
+                   transition: width 0.1s linear; }
+  .upload-pct { margin-top: 8px; font-size: 0.8rem; }
+
+  .drop-overlay { position: fixed; inset: 16px; pointer-events: none;
+                  border: 3px dashed var(--accent); border-radius: 12px;
+                  background: rgba(96, 165, 250, 0.08);
+                  display: flex; align-items: center; justify-content: center;
+                  font-size: 1.4rem; color: var(--text-bright);
+                  z-index: 999; }
+  .drop-overlay .hint { background: var(--panel); padding: 16px 24px;
+                        border-radius: 8px; border: 1px solid var(--border);
+                        text-align: center; }
+  .drop-overlay .hint .sub { font-size: 0.85rem; color: var(--text-dim);
+                             margin-top: 4px; }
+
+  .panel {
+    background: var(--panel); border-radius: 8px; padding: 20px;
+    margin-bottom: 20px;
+  }
+  .summary-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;
+  }
+  .summary-grid .stat {
+    background: var(--row); border-radius: 6px; padding: 12px 16px;
+  }
+  .summary-grid .stat .label {
+    color: var(--text-dim); font-size: 0.75rem;
+    text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;
+  }
+  .summary-grid .stat .value {
+    color: var(--text-bright); font-size: 1.3rem; font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+
+  h2 { color: var(--text-bright); font-size: 1.1rem; margin: 24px 0 12px; }
+  .specials { color: var(--warn); font-size: 0.85rem; }
+  .err { color: var(--bad); padding: 12px; }
+
+  /* Compact summary line above the chart */
+  .chart-wrap { background: var(--panel); border-radius: 8px;
+                padding: 20px; margin-bottom: 20px; }
+
+  /* Header layout: title left, actions right */
+  .header-row { display: flex; justify-content: space-between;
+                align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+  .header-row .actions { display: flex; gap: 8px; }
+  .btn {
+    background: var(--row); color: var(--text); border: 1px solid var(--border);
+    padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 0.85rem;
+    font-family: inherit;
+  }
+  .btn:hover { background: var(--row-hover); border-color: var(--accent); }
+  .btn.primary { background: var(--accent); color: #0f1419; border-color: var(--accent); font-weight: 600; }
+  .btn.primary:hover { filter: brightness(1.1); }
+
+  /* File picker */
+  .picker-options { display: flex; align-items: center; gap: 14px;
+                    margin-bottom: 12px; padding: 10px 14px;
+                    background: var(--row);
+                    border: 1px solid var(--border); border-radius: 6px; }
+  .picker-options label { display: flex; flex-direction: column; gap: 4px;
+                          font-size: 0.75rem; color: var(--text-dim);
+                          text-transform: uppercase; letter-spacing: 0.04em; }
+  .picker-options input[type="number"] {
+                          background: var(--bg); color: var(--text);
+                          border: 1px solid var(--border); padding: 6px 10px;
+                          border-radius: 4px; font-size: 0.9rem; width: 100px;
+                          font-variant-numeric: tabular-nums; font-family: inherit; }
+  .picker-options input:focus { outline: none; border-color: var(--accent); }
+  .picker-options-help { font-size: 0.8rem; flex: 1; line-height: 1.45; }
+  .picker-path {
+    font-family: ui-monospace, 'SF Mono', Consolas, monospace;
+    font-size: 0.85rem; color: var(--text-dim); padding: 6px 10px;
+    background: var(--row); border-radius: 4px; margin-bottom: 10px;
+    word-break: break-all;
+  }
+  .picker-input-row {
+    display: flex; gap: 8px; margin-bottom: 16px;
+  }
+  .picker-input-row input {
+    flex: 1; background: var(--row); color: var(--text);
+    border: 1px solid var(--border); padding: 8px 12px; border-radius: 4px;
+    font-family: ui-monospace, 'SF Mono', Consolas, monospace; font-size: 0.9rem;
+  }
+  .picker-input-row input:focus { outline: none; border-color: var(--accent); }
+  .type-tag {
+    display: inline-block; padding: 1px 6px; border-radius: 3px;
+    font-size: 0.7rem; font-weight: 700; letter-spacing: 0.04em;
+    text-transform: uppercase; margin-right: 8px;
+  }
+  .type-tag.dir { background: var(--border); color: var(--text-dim); }
+  .type-tag.log { background: var(--accent); color: #0f1419; }
+  .picker-empty { color: var(--text-dim); padding: 20px; text-align: center; }
