@@ -162,6 +162,16 @@ that encounter), and a per-actor table with avg/median/p95/best rates.
 Tanking gets the same Damage / Healing / Δ Life sub-toggle on its chart
 and heatmap, with diverging blue/red colors for delta.
 
+Tick exactly two rows in the session list and the action bar gains a
+**Compare** button. Click it to open the **diff view** — two encounter
+cards at the top, a headline strip with Δ duration / Δ damage / Δ raid
+DPS / Δ healing, and a per-actor table with **Damage / Damage taken /
+Healing** tabs. Toggle between **Side-by-side** (two bars per row, A
+blue / B green) and **Delta** (one centered-on-zero bar per row,
+colored by *meaning* — green when the change is good for the active
+metric, red when it's bad). Useful for "what did this new weapon
+actually do?" comparisons inside one raid night.
+
 Drag-and-drop a log file anywhere on the page to load it without going
 through the file picker. The **Change log** button in the header re-opens
 the picker so you can switch logs without restarting. The **Pet owners**
@@ -305,7 +315,10 @@ flurry/
 │   ├── analyzer.py           # fight analysis (FightResult, Encounter, Timeline)
 │   ├── sidecar.py            # per-log persistence: pet owners + manual encounters
 │   ├── report.py             # text + HTML rendering
-│   ├── server.py             # local web UI (stdlib http.server + inline HTML)
+│   ├── server.py             # local web UI (stdlib http.server + JSON API)
+│   ├── static/               # front-end assets served via /static/<name>
+│   │   ├── styles.css
+│   │   └── app.js
 │   └── cli.py                # argparse entry functions
 ├── flurry.bat                # Windows launcher (wraps `python -m flurry`)
 ├── flurry.sh                 # POSIX launcher
@@ -339,8 +352,11 @@ anywhere.
 
 What's left, in rough order of usefulness:
 
-- **Log diffing** — compare the same boss before and after a gear change
-  ("what did this new weapon actually do?").
+- **Cross-log diffing** — same shape as the in-log Compare view, but
+  for two encounters from *different* logs (the typical "before/after
+  gear change across raid nights" case). Needs the server to track
+  more than one loaded log at a time, plus a UI to pick the second
+  log.
 - **JSON export** — `--json` flags on the CLI tools for piping into
   other tools. The UI already has its own JSON via `/api/*`.
 - **Live tail mode** — watch DPS / HPS / DTPS update in real time as
@@ -356,8 +372,8 @@ What's left, in rough order of usefulness:
 
 Things that used to be on this list and have shipped — encounter
 grouping, pet ownership, session-summary rollups, healing tab, tanking
-tab with avoidance breakdown, life-delta toggle. See `RELEASES.md` for
-the running history.
+tab with avoidance breakdown, life-delta toggle, in-log encounter
+diff. See `RELEASES.md` for the running history.
 
 ## License
 
