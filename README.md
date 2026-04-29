@@ -172,6 +172,15 @@ colored by *meaning* — green when the change is good for the active
 metric, red when it's bad). Useful for "what did this new weapon
 actually do?" comparisons inside one raid night.
 
+Tick exactly **one** row instead and the action bar gains a **Compare
+across logs** button. Click it to load a second log (drag-drop the
+file, OS browse, or paste a path) and pick which encounter from that
+log to compare against. Same diff view, with each encounter card
+labeled by its log filename so it's obvious which side came from
+which raid night. Built for the "before/after gear change *between*
+raid nights" case — same boss, two different log files. Swapping the
+primary log automatically clears the comparison.
+
 Drag-and-drop a log file anywhere on the page to load it without going
 through the file picker. The **Change log** button in the header re-opens
 the picker so you can switch logs without restarting. The **Pet owners**
@@ -352,11 +361,6 @@ anywhere.
 
 What's left, in rough order of usefulness:
 
-- **Cross-log diffing** — same shape as the in-log Compare view, but
-  for two encounters from *different* logs (the typical "before/after
-  gear change across raid nights" case). Needs the server to track
-  more than one loaded log at a time, plus a UI to pick the second
-  log.
 - **JSON export** — `--json` flags on the CLI tools for piping into
   other tools. The UI already has its own JSON via `/api/*`.
 - **Live tail mode** — watch DPS / HPS / DTPS update in real time as
@@ -373,7 +377,8 @@ What's left, in rough order of usefulness:
 Things that used to be on this list and have shipped — encounter
 grouping, pet ownership, session-summary rollups, healing tab, tanking
 tab with avoidance breakdown, life-delta toggle, in-log encounter
-diff. See `RELEASES.md` for the running history.
+diff, cross-log encounter diff. See `RELEASES.md` for the running
+history.
 
 ## License
 
