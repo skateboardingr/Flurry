@@ -104,6 +104,91 @@ async function withParseProgress(promiseFactory, app, headline) {
   }
 }
 
+// --- Live-mode header indicator + toggle ------------------------------
+//
+// The header has a small ● dot that reports live state at a glance:
+//   green-pulsing → follower running, recent events landing
+//   yellow         → follower running but stale (no new events for ~4s)
+//   dim grey       → live mode off OR no log loaded
+//
+// We poll /api/live/snapshot at 1s (slower than the overlay's 250ms)
+// to drive the indicator; the indicator only needs to flip occasionally,
+// not animate every counter. The overlay opens a separate window with
+// its own faster poller for the actual numbers.
+
+let _liveStatusPoll = null;
+let _liveLastEventTs = null;
+let _liveTicksSinceEvent = 0;
+
+function startLiveStatusPoll() {
+  if (_liveStatusPoll) return;  // already running
+  const tick = async () => {
+    try {
+      const r = await fetch('/api/live/snapshot', {cache: 'no-store'});
+      if (r.ok) {
+        const d = await r.json();
+        if (d.last_event_ts === _liveLastEventTs) {
+          _liveTicksSinceEvent++;
+        } else {
+          _liveTicksSinceEvent = 0;
+          _liveLastEventTs = d.last_event_ts;
+        }
+        applyLiveIndicator(d, _liveTicksSinceEvent);
+      }
+    } catch (e) { /* keep polling */ }
+  };
+  tick();  // first tick immediately
+  _liveStatusPoll = setInterval(tick, 1000);
+}
+
+function applyLiveIndicator(d, ticksSinceEvent) {
+  const btn = document.getElementById('live-btn');
+  const dot = btn ? btn.querySelector('.live-dot') : null;
+  const label = document.getElementById('live-label');
+  if (!btn || !dot || !label) return;
+  let state;
+  if (!d.logfile_basename) {
+    state = 'idle';
+    label.textContent = 'Live (no log)';
+  } else if (!d.live_enabled || !d.follower_running) {
+    state = 'idle';
+    label.textContent = 'Live: off';
+  } else if (ticksSinceEvent > 4) {
+    // ~4s without new events at our 1s poll cadence
+    state = 'stale';
+    label.textContent = 'Live: idle';
+  } else {
+    state = 'live';
+    label.textContent = 'Live';
+  }
+  dot.classList.remove('live', 'stale', 'idle');
+  dot.classList.add(state);
+  btn.classList.toggle('off', state === 'idle' && d.live_enabled === false);
+}
+
+async function toggleLive() {
+  const btn = document.getElementById('live-btn');
+  if (!btn) return;
+  // Read current state from the indicator's classes — last poll wrote it.
+  const dot = btn.querySelector('.live-dot');
+  const wasLive = dot && (dot.classList.contains('live') || dot.classList.contains('stale'));
+  try {
+    await fetch('/api/live/toggle', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled: !wasLive}),
+    });
+  } catch (e) { /* indicator flips on the next poll regardless */ }
+  // Force an immediate poll for snappy feedback.
+  if (_liveStatusPoll) {
+    _liveTicksSinceEvent = 0;
+    fetch('/api/live/snapshot', {cache: 'no-store'})
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d) applyLiveIndicator(d, 0); })
+      .catch(() => {});
+  }
+}
+
 function setHeader(title, sub, hasLog) {
   document.getElementById('title').textContent = title;
   document.getElementById('sub').textContent = sub;
@@ -166,7 +251,7 @@ async function renderPicker(path) {
   const app = document.getElementById('app');
   app.innerHTML = '<div class="sub">Loading…</div>';
   setHeader('Open log',
-            'Browse, paste a path, or drag a log file anywhere on the page',
+            'Click a log file below, hit Browse… for the native picker, or paste a full path',
             false);
 
   // Fetch current params alongside the dir listing so the "Last N hours"
@@ -210,12 +295,18 @@ async function renderPicker(path) {
       'Navigate up or paste a path above.</div>'
     : '';
 
+  // Layout (top → bottom):
+  //   1. Last N hours (parse-window control — useful before any open)
+  //   2. Path input + buttons (Open / Browse… / Upload — primary actions)
+  //   3. Parent-dir link (navigation aid for the file table below)
+  //   4. File table
+  // The current dir's path used to be repeated above the parent link;
+  // removed since the input box already shows it.
   app.innerHTML = `
     <div class="panel">
-      <div class="picker-path">${escapeHTML(data.path)}</div>
-      <div style="margin-bottom: 12px;">${parentLink}</div>
       ${pickerOptionsHTML(sessionParams)}
       ${pickerInputHTML(data.path)}
+      <div style="margin-bottom: 12px;">${parentLink}</div>
       ${(dirRows || fileRows) ? `
         <table>
           <thead><tr>
@@ -284,16 +375,39 @@ function wirePickerOptions() {
 }
 
 function pickerInputHTML(currentPath) {
+  // Three ways to load a log:
+  //   - "Open as log" (or click any file row in the list above):
+  //     follows the file IN PLACE. Live tail tracks new writes from EQ.
+  //   - "Browse…": opens the native OS file dialog server-side
+  //     (tkinter), returns the picked path, then loads via /api/open.
+  //     Same live-tracking behavior as Open as log, just without
+  //     having to type/navigate the path.
+  //   - "Upload static copy": browser file dialog, copies the bytes
+  //     to a temp dir, and follows that copy. The copy doesn't grow
+  //     as EQ writes — only useful for analyzing a log from another
+  //     machine where you don't have a direct path.
   return `
     <div class="picker-input-row">
       <input id="picker-input" placeholder="Or paste a full path…"
              value="${escapeHTML(currentPath)}">
-      <button class="btn" id="picker-go">Go</button>
-      <button class="btn primary" id="picker-open">Open as log</button>
+      <button class="btn" id="picker-go"
+              title="Navigate to the path in the input box (browse this folder).">Go</button>
+      <button class="btn primary" id="picker-open"
+              title="Load the path in the input as the active log. Live tail tracks new writes from EQ.">Open as log</button>
+      <button class="btn primary" id="picker-browse-native"
+              title="Open the native Windows file picker. Loads in live-tracking mode (same as Open as log) — flurry keeps watching the file as EQ writes new events.">Browse…</button>
       <button class="btn" id="picker-upload"
-              title="Pick a log file via the OS file dialog. The file is copied to a temp dir (browsers don't expose disk paths to JS).">Upload…</button>
+              title="Browser file dialog → copies the file to a temp dir. The copy is STATIC — won't update as EQ writes new events. Only useful when you don't have direct disk access to the file.">Upload static copy…</button>
       <input type="file" id="picker-upload-input" accept=".txt,.log,.*"
              style="display:none">
+    </div>
+    <div class="picker-help sub">
+      <strong>Live tracking</strong>: click <strong>Browse…</strong>
+      for the native Windows file picker, click a log file in the list
+      above, or paste its full path and hit <strong>Open as log</strong>.
+      <strong>Upload static copy</strong> is only for analyzing a log
+      file you don't have direct disk access to — the copy doesn't
+      grow with EQ.
     </div>`;
 }
 
@@ -301,6 +415,7 @@ function wirePickerInput() {
   const input = document.getElementById('picker-input');
   const go = document.getElementById('picker-go');
   const open = document.getElementById('picker-open');
+  const browseNative = document.getElementById('picker-browse-native');
   const uploadBtn = document.getElementById('picker-upload');
   const uploadInput = document.getElementById('picker-upload-input');
   if (!input) return;
@@ -309,6 +424,39 @@ function wirePickerInput() {
   input.addEventListener('keydown', e => {
     if (e.key === 'Enter') renderPicker(input.value);
   });
+  // Browse… → server-side native file dialog (Tk) → returns the
+  // picked path and loads it in live mode. The dialog blocks server-
+  // side until the user picks/cancels, so this fetch can take a
+  // while; show a transient "Opening…" state on the button.
+  if (browseNative) {
+    browseNative.addEventListener('click', async () => {
+      const orig = browseNative.textContent;
+      browseNative.textContent = 'Opening dialog…';
+      browseNative.disabled = true;
+      try {
+        const r = await fetch('/api/browse-native', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({initial_dir: input.value || null}),
+        });
+        if (!r.ok) {
+          const t = await r.text();
+          alert('Browse failed: ' + (t || ('HTTP ' + r.status)));
+          return;
+        }
+        const d = await r.json();
+        if (d.cancelled || !d.path) return;  // user dismissed
+        // Loaded — bounce to session view to render the new log.
+        location.hash = '#/';
+        route();
+      } catch (e) {
+        alert('Browse error: ' + e.message);
+      } finally {
+        browseNative.textContent = orig;
+        browseNative.disabled = false;
+      }
+    });
+  }
   uploadBtn.addEventListener('click', () => uploadInput.click());
   uploadInput.addEventListener('change', () => {
     if (uploadInput.files.length > 0) uploadLog(uploadInput.files[0]);
@@ -417,7 +565,89 @@ async function renderSession() {
     // Compare button used to live here; it moved into the action bar
     // (next to Merge / Split / Clear) since it's strictly a 2-selection
     // action with no whole-log mode like Session summary has.
+
+    // Live-mode toggle. Defaults ON when a log loads (server-side), so
+    // the button shows the current state and lets the user flip it for
+    // historical-log review. Indicator dot pulses when live + new
+    // events are landing; dims when paused or stale.
+    const liveBtn = document.createElement('button');
+    liveBtn.className = 'btn live-btn';
+    liveBtn.id = 'live-btn';
+    liveBtn.title = 'Live tail: when on, the server follows the log file ' +
+                    'and the overlay updates in real time. Default on for ' +
+                    'active raids; flip off for historical log review.';
+    liveBtn.innerHTML = `<span class="live-dot"></span><span id="live-label">Live</span>`;
+    liveBtn.addEventListener('click', toggleLive);
+    sessActions.appendChild(liveBtn);
+
+    // Pop-out overlay button. Opens /overlay in a separate browser
+    // window sized for an on-screen DPS meter. Pinning (always-on-top
+    // + click-through) is handled by the Pin/Unpin buttons below,
+    // which use Win32 ctypes server-side rather than relying on the
+    // user to install AHK / PowerToys.
+    const overlayBtn = document.createElement('button');
+    overlayBtn.className = 'btn';
+    overlayBtn.id = 'overlay-btn';
+    overlayBtn.textContent = 'Pop out overlay';
+    overlayBtn.title = 'Open the live overlay in its own window. Use ' +
+                       'the Pin overlay button to make it always-on-top ' +
+                       'and click-through over EQ.';
+    overlayBtn.addEventListener('click', () => {
+      // Modest default size. User can resize once it's open.
+      window.open('/overlay', 'flurry-overlay',
+                  'width=320,height=380,resizable=yes,menubar=no,toolbar=no,location=no,status=no');
+    });
+    sessActions.appendChild(overlayBtn);
+
+    // Pin / Unpin overlay buttons. Pinning applies always-on-top +
+    // click-through via Win32 SetWindowLongPtr (server-side). MUST
+    // live in the main UI rather than inside the overlay itself —
+    // once click-through is on, the overlay can't be clicked anymore,
+    // so the unpin control has to be reachable from somewhere else.
+    const pinBtn = document.createElement('button');
+    pinBtn.className = 'btn';
+    pinBtn.id = 'pin-overlay-btn';
+    pinBtn.textContent = 'Pin overlay';
+    pinBtn.title = 'Make the overlay window always-on-top + click-through ' +
+                   '(mouse passes through to EQ underneath). Open the ' +
+                   'overlay first via Pop out overlay, then click Pin.';
+    pinBtn.addEventListener('click', async () => {
+      try {
+        const r = await fetch('/api/overlay/pin', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: '{}',
+        });
+        if (!r.ok) {
+          const txt = await r.text();
+          alert('Could not pin overlay: ' + (txt || `HTTP ${r.status}`));
+        }
+      } catch (e) {
+        alert('Pin failed: ' + e.message);
+      }
+    });
+    sessActions.appendChild(pinBtn);
+
+    const unpinBtn = document.createElement('button');
+    unpinBtn.className = 'btn';
+    unpinBtn.id = 'unpin-overlay-btn';
+    unpinBtn.textContent = 'Unpin overlay';
+    unpinBtn.title = 'Remove always-on-top + click-through from the overlay ' +
+                     'so you can interact with it (drag, click Copy, etc.).';
+    unpinBtn.addEventListener('click', async () => {
+      try {
+        await fetch('/api/overlay/unpin', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: '{}',
+        });
+      } catch (e) { /* idempotent — fine to swallow */ }
+    });
+    sessActions.appendChild(unpinBtn);
   }
+
+  // Kick off the live-status poller for the header indicator.
+  startLiveStatusPoll();
 
   const s = data.summary;
   const summaryHTML = `
@@ -3615,8 +3845,13 @@ function _showDropOverlay() {
   div.className = 'drop-overlay';
   div.innerHTML = `
     <div class="hint">
-      <div>Drop log file to load</div>
+      <div>Drop log file to upload (static copy)</div>
       <div class="sub">eqlog_&lt;character&gt;_&lt;server&gt;.txt</div>
+      <div class="sub" style="margin-top:8px; max-width: 420px;">
+        Drag-drop creates a snapshot that won't update with new EQ
+        events. For live tracking, instead use <strong>Change log</strong>
+        and click your eqlog file from the list, or paste its path.
+      </div>
     </div>`;
   document.body.appendChild(div);
 }

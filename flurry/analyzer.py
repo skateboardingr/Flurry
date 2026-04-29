@@ -383,6 +383,162 @@ def detect_fights(logfile: str,
     return fights
 
 
+class _CombatDetector:
+    """Stateful, incremental version of the detect_combat inner loop.
+
+    Holds in-progress fights across multiple `feed_event()` calls so a
+    follower thread can append parsed events as the log grows. The
+    static `detect_combat` is now a thin wrapper that pumps file-walked
+    events through this detector and finalizes — same external behavior.
+
+    Live mode flow:
+      d = _CombatDetector(gap_seconds=15, ...)
+      for ev in initial_walk: d.feed_event(ev)
+      d.expire_stale()                        # close any orphans
+      # ... follower thread runs:
+      while live:
+        for ev in newly_appended: d.feed_event(ev)
+        d.expire_stale()                      # housekeeping
+      # ... endpoints serve:
+      fights, heals = d.snapshot(include_in_progress=True)
+
+    Snapshots can be taken at any time. `include_in_progress=True` rolls
+    still-open fights into the returned list with `fight_complete=False`
+    so the live UI can render them as the active fight.
+    """
+
+    def __init__(self,
+                 gap_seconds: int = 15,
+                 min_damage: int = 10_000,
+                 min_duration_seconds: int = 0,
+                 heals_extend_fights: bool = False,
+                 special_mods=DEFAULT_SPECIAL_MODS):
+        self.gap_seconds = gap_seconds
+        self.min_damage = min_damage
+        self.min_duration_seconds = min_duration_seconds
+        self.heals_extend_fights = heals_extend_fights
+        self.special_mods = special_mods
+        self.in_progress: Dict[str, _FightBuilder] = {}
+        self.completed: List[FightResult] = []
+        self.heals: List[Heal] = []
+        # Latest event timestamp seen. Used by snapshot() to know how
+        # current the data is, and by callers running periodic
+        # expire_stale() between events.
+        self.last_event_ts: Optional[datetime] = None
+
+    def _close(self, target: str, end_ts: datetime, complete: bool):
+        b = self.in_progress.pop(target)
+        self.completed.append(b.finalize(end_ts, complete))
+
+    def _expire_if_stale(self, target: str, now: datetime):
+        b = self.in_progress.get(target)
+        if b is None:
+            return
+        if (now - b.last_ts).total_seconds() > self.gap_seconds:
+            self._close(target, b.last_ts, complete=False)
+
+    def _record_damage(self, ev, kind: str):
+        target = ev.target
+        self._expire_if_stale(target, ev.timestamp)
+        if target not in self.in_progress:
+            self.in_progress[target] = _FightBuilder(
+                target, ev.timestamp, self.special_mods)
+        self.in_progress[target].record_hit(ev, kind)
+
+    def feed_event(self, ev) -> None:
+        """Process one parsed event. Mirrors the dispatch in
+        detect_combat's inner loop."""
+        self.last_event_ts = ev.timestamp
+        if isinstance(ev, MeleeHit):
+            self._record_damage(ev, 'melee')
+        elif isinstance(ev, SpellDamage):
+            self._record_damage(ev, 'spell')
+        elif isinstance(ev, MeleeMiss):
+            self._expire_if_stale(ev.target, ev.timestamp)
+            if ev.target not in self.in_progress:
+                # Open the fight on a miss too — without this, a target
+                # being completely avoided (rune / parry / miss every
+                # swing, no damage either way) silently fails to
+                # register as in-progress, and the live overlay never
+                # shows it as an active fight. Static parses are
+                # unaffected: a miss-only fight has total_damage=0 and
+                # is dropped by the min_damage filter in snapshot().
+                self.in_progress[ev.target] = _FightBuilder(
+                    ev.target, ev.timestamp, self.special_mods)
+            self.in_progress[ev.target].record_miss(ev)
+        elif isinstance(ev, DeathMessage):
+            if ev.victim in self.in_progress:
+                self._close(ev.victim, ev.timestamp, complete=True)
+        elif isinstance(ev, HealEvent):
+            self.heals.append(Heal(
+                timestamp=ev.timestamp,
+                healer=ev.healer,
+                target=ev.target,
+                amount=ev.amount,
+                spell=ev.spell,
+                modifiers=list(ev.modifiers),
+            ))
+            if self.heals_extend_fights:
+                # Treat heals as combat activity: bump every in-progress
+                # fight's last_ts so a phase-pause full of heals doesn't
+                # let the fight expire. Run staleness expiration first
+                # (using the heal timestamp) so genuinely-dead fights
+                # don't get revived by a delayed heal tick.
+                for tgt in list(self.in_progress.keys()):
+                    self._expire_if_stale(tgt, ev.timestamp)
+                for builder in self.in_progress.values():
+                    if builder.last_ts < ev.timestamp:
+                        builder.last_ts = ev.timestamp
+
+    def expire_stale(self, now: Optional[datetime] = None) -> None:
+        """Close any in-progress fights whose last_ts is older than
+        gap_seconds relative to `now`. Called between events to give the
+        UI a way to know "this fight ended even though no death message
+        landed" — typical for trash mobs you walked away from. Defaults
+        to using last_event_ts if no `now` is supplied."""
+        anchor = now or self.last_event_ts
+        if anchor is None:
+            return
+        for target in list(self.in_progress.keys()):
+            self._expire_if_stale(target, anchor)
+
+    def finalize_all(self) -> None:
+        """Force-close every in-progress fight at its own last_ts. Used
+        by detect_combat at end-of-walk to flush fights still open when
+        the log ran out — equivalent to the old end-of-loop close pass."""
+        for target in list(self.in_progress.keys()):
+            b = self.in_progress[target]
+            self._close(target, b.last_ts, complete=False)
+
+    def snapshot(self, include_in_progress: bool = False
+                 ) -> Tuple[List[FightResult], List[Heal]]:
+        """Return the current detector state as (fights, heals).
+
+        `include_in_progress=True` adds still-open fights to the output
+        with fight_complete=False — used by live-mode callers who want
+        to see the active fight's stats. End-of-walk callers pass False
+        and rely on finalize_all() to have closed everything first.
+
+        Filtering and 1-indexed fight_id assignment match detect_combat
+        exactly so the static and live paths produce comparable data.
+        """
+        fights = list(self.completed)
+        if include_in_progress:
+            for b in self.in_progress.values():
+                fights.append(b.finalize(b.last_ts, fight_complete=False))
+        filtered = [
+            f for f in fights
+            if f.total_damage >= self.min_damage
+            and f.duration_seconds >= self.min_duration_seconds
+            and f.target != 'You'
+            and not f.target.endswith('`s pet')
+        ]
+        filtered.sort(key=lambda f: f.start)
+        for i, f in enumerate(filtered, start=1):
+            f.fight_id = i
+        return filtered, list(self.heals)
+
+
 def detect_combat(logfile: str,
                   gap_seconds: int = 15,
                   min_damage: int = 10_000,
@@ -435,20 +591,70 @@ def detect_combat(logfile: str,
       populated. Excludes fights whose target is `You` or a backtick-pet
       and fights below min_damage.
     """
-    in_progress: Dict[str, _FightBuilder] = {}
-    completed: List[FightResult] = []
-    heals: List[Heal] = []
+    detector = _CombatDetector(
+        gap_seconds=gap_seconds,
+        min_damage=min_damage,
+        min_duration_seconds=min_duration_seconds,
+        heals_extend_fights=heals_extend_fights,
+        special_mods=special_mods,
+    )
+    end_offset = walk_into_detector(
+        logfile, detector,
+        since=since, progress_cb=progress_cb,
+    )
+    # Close any still-open fights at end of log so this static-walk
+    # caller sees a fully-finalized result.
+    detector.finalize_all()
+    fights, heals = detector.snapshot(include_in_progress=False)
+    # `end_offset` isn't part of the public detect_combat contract; we
+    # only return it to live-mode callers via walk_into_detector.
+    del end_offset
+    return fights, heals
 
-    # Resolve `since` to a starting byte offset. Skipping the prefix of a
-    # huge log is the bulk of the speedup; the inline `since` filter
-    # below is a backstop for any old lines that sneak through (e.g. an
-    # off-by-one near the cutoff).
-    start_offset = 0
-    if since is not None:
-        try:
-            start_offset = find_offset_for_timestamp(logfile, since)
-        except OSError:
-            start_offset = 0
+
+def walk_into_detector(logfile: str,
+                       detector: '_CombatDetector',
+                       since: Optional[datetime] = None,
+                       start_offset: Optional[int] = None,
+                       progress_cb: Optional[Callable[[int, int], None]] = None,
+                       ) -> int:
+    """Walk the log file and feed each parsed event into `detector`.
+
+    Returns the byte offset reached at end of walk so live-mode callers
+    can pick up the follower from there (no double-parsing). The detector
+    is NOT finalized here — callers control whether to expire stale
+    fights, finalize all, or leave in-progress fights open for the
+    follower to extend.
+
+    Args:
+      logfile: path to an EQ log file.
+      detector: a `_CombatDetector` to feed events into. Caller-owned.
+      since: optional cutoff datetime; events before are skipped. Resolved
+            to a byte offset via `find_offset_for_timestamp` so the
+            file-prefix walk is skipped on long logs.
+      start_offset: optional explicit byte offset to start at, bypassing
+            the `since` resolution. Used by the live follower to resume
+            from the position the initial walk left off.
+      progress_cb: optional `(bytes_read, total_bytes)` callback, both
+            relative to the slice walked.
+
+    Caller pattern (live mode):
+        d = _CombatDetector(...)
+        end = walk_into_detector(path, d, since=cutoff)
+        # ... background thread continues from `end`:
+        end = walk_into_detector(path, d, start_offset=end)
+    """
+    # Resolve `since` to a starting byte offset unless one was given.
+    # Skipping the prefix of a huge log is the bulk of the speedup; the
+    # inline `since` filter below is a backstop for any old lines that
+    # sneak through (e.g. an off-by-one near the cutoff).
+    if start_offset is None:
+        start_offset = 0
+        if since is not None:
+            try:
+                start_offset = find_offset_for_timestamp(logfile, since)
+            except OSError:
+                start_offset = 0
 
     file_size = os.path.getsize(logfile) if os.path.isfile(logfile) else 0
     # Report progress relative to the slice we actually walk so a slice
@@ -456,30 +662,17 @@ def detect_combat(logfile: str,
     # we're doing, not the work we skipped.
     slice_size = max(0, file_size - start_offset)
     inner_progress = None
+    last_pos = [start_offset]
     if progress_cb is not None:
         def inner_progress(abs_pos: int):
+            last_pos[0] = abs_pos
             try:
                 progress_cb(max(0, abs_pos - start_offset), slice_size)
             except Exception:
                 pass
-
-    def _close(target: str, end_ts: datetime, complete: bool):
-        b = in_progress.pop(target)
-        completed.append(b.finalize(end_ts, complete))
-
-    def _expire_if_stale(target: str, now: datetime):
-        b = in_progress.get(target)
-        if b is None:
-            return
-        if (now - b.last_ts).total_seconds() > gap_seconds:
-            _close(target, b.last_ts, complete=False)
-
-    def _record_damage(ev, kind: str):
-        target = ev.target
-        _expire_if_stale(target, ev.timestamp)
-        if target not in in_progress:
-            in_progress[target] = _FightBuilder(target, ev.timestamp, special_mods)
-        in_progress[target].record_hit(ev, kind)
+    else:
+        def inner_progress(abs_pos: int):
+            last_pos[0] = abs_pos
 
     for line in tail_file(logfile, read_all=True, follow=False,
                           start_offset=start_offset,
@@ -489,59 +682,11 @@ def detect_combat(logfile: str,
             continue
         if since is not None and ev.timestamp < since:
             continue
-
-        if isinstance(ev, MeleeHit):
-            _record_damage(ev, 'melee')
-        elif isinstance(ev, SpellDamage):
-            _record_damage(ev, 'spell')
-        elif isinstance(ev, MeleeMiss):
-            _expire_if_stale(ev.target, ev.timestamp)
-            if ev.target in in_progress:
-                in_progress[ev.target].record_miss(ev)
-        elif isinstance(ev, DeathMessage):
-            if ev.victim in in_progress:
-                _close(ev.victim, ev.timestamp, complete=True)
-        elif isinstance(ev, HealEvent):
-            heals.append(Heal(
-                timestamp=ev.timestamp,
-                healer=ev.healer,
-                target=ev.target,
-                amount=ev.amount,
-                spell=ev.spell,
-                modifiers=list(ev.modifiers),
-            ))
-            if heals_extend_fights:
-                # Treat heals as combat activity: bump every in-progress
-                # fight's last_ts so a phase-pause full of heals doesn't
-                # let the fight expire. Run staleness expiration first
-                # (using the heal timestamp) so genuinely-dead fights
-                # don't get revived by a delayed heal tick.
-                for tgt in list(in_progress.keys()):
-                    _expire_if_stale(tgt, ev.timestamp)
-                for builder in in_progress.values():
-                    if builder.last_ts < ev.timestamp:
-                        builder.last_ts = ev.timestamp
-
-    # Close any still-open fights at end of log.
-    for target in list(in_progress.keys()):
-        b = in_progress[target]
-        _close(target, b.last_ts, complete=False)
-
-    # Drop the logging player and pets (obvious self-damage noise) and
-    # anything below the damage threshold. Other-player deaths (target is
-    # another player's proper name) can still slip through; the UI is the
-    # right place to suppress those once it has a player roster.
-    filtered = [
-        f for f in completed
-        if f.total_damage >= min_damage
-        and f.duration_seconds >= min_duration_seconds
-        and f.target != 'You'
-        and not f.target.endswith('`s pet')
-    ]
-    filtered.sort(key=lambda f: f.start)
-    for i, f in enumerate(filtered, start=1):
-        f.fight_id = i
-    return filtered, heals
+        detector.feed_event(ev)
+    # Return the most recent byte position reported by tail_file's
+    # progress callback, or fall back to file size if no callback fired
+    # (very small files, no chunk boundaries crossed).
+    return max(last_pos[0], file_size)
 
 
 # ----- Parser-coverage debug -----

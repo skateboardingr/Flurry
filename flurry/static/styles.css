@@ -536,6 +536,22 @@
                      gap: 12px; font-size: 0.9rem; }
   .cross-comp-meta strong { color: var(--text-bright); }
 
+  /* Live-mode header button + indicator dot. The dot pulses while
+     active events are landing; dims grey when live is off; turns
+     yellow when live is on but no new combat for a few seconds. */
+  .live-btn { display: inline-flex; align-items: center; gap: 6px; }
+  .live-btn .live-dot { display: inline-block; width: 8px; height: 8px;
+                        border-radius: 50%; background: var(--text-dim);
+                        transition: background 0.2s ease; }
+  .live-btn .live-dot.live  { background: var(--good);
+                              animation: live-pulse 2s ease-in-out infinite; }
+  .live-btn .live-dot.stale { background: var(--warn); }
+  .live-btn .live-dot.idle  { background: var(--text-dim); }
+  @keyframes live-pulse {
+    0%, 100% { opacity: 0.6; }
+    50%      { opacity: 1; }
+  }
+
   .diff-hidden-strip { display: flex; flex-wrap: wrap; gap: 6px;
                        align-items: center; }
   .diff-unhide { background: var(--row); border: 1px solid var(--border);
@@ -644,8 +660,17 @@
     word-break: break-all;
   }
   .picker-input-row {
-    display: flex; gap: 8px; margin-bottom: 16px;
+    display: flex; gap: 8px; margin-bottom: 8px;
   }
+  /* Help line under the picker buttons explaining the live-vs-static
+     difference between Open and Upload. Sits between the input row
+     and the file listing. */
+  .picker-help {
+    font-size: 0.82rem; line-height: 1.5; padding: 8px 12px;
+    background: var(--row); border-left: 3px solid var(--accent);
+    border-radius: 4px; margin-bottom: 16px;
+  }
+  .picker-help strong { color: var(--text-bright); }
   .picker-input-row input {
     flex: 1; background: var(--row); color: var(--text);
     border: 1px solid var(--border); padding: 8px 12px; border-radius: 4px;

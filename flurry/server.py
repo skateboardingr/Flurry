@@ -23,17 +23,232 @@ import socketserver
 import statistics
 import tempfile
 import threading
+import time
 import urllib.parse
 import webbrowser
 from datetime import datetime, timedelta
 from typing import List, Optional
 
+import sys
+
 from .analyzer import (
     FightResult, Encounter, Heal,
     detect_combat, group_into_encounters, apply_pet_owners,
     merge_encounter, bucket_hits, collect_parser_stats,
+    walk_into_detector, _CombatDetector,
     DEFAULT_SPECIAL_MODS,
 )
+
+
+# ----- Win32 overlay-pinning helpers (always-on-top + click-through) -----
+#
+# The overlay window can be made always-on-top AND click-through so
+# mouse events pass through to EQ underneath. Browsers don't expose
+# these capabilities to JavaScript, so we apply them via Win32 from
+# the server side: find the browser window by title, toggle its
+# WS_EX_TOPMOST / WS_EX_TRANSPARENT / WS_EX_LAYERED flags via
+# SetWindowLongPtrW.
+#
+# Pin/unpin buttons live in the MAIN UI, not in the overlay itself —
+# because once click-through is on, the overlay can't be clicked
+# anymore. Toggling off has to come from the always-clickable main UI.
+_user32 = None
+if sys.platform == 'win32':
+    try:
+        import ctypes as _ctypes
+        from ctypes import wintypes as _wintypes
+
+        _user32 = _ctypes.windll.user32
+
+        _GWL_EXSTYLE = -20
+        _WS_EX_TOPMOST = 0x00000008
+        _WS_EX_TRANSPARENT = 0x00000020
+        _WS_EX_LAYERED = 0x00080000
+        _LWA_ALPHA = 0x00000002
+        _HWND_TOPMOST = _wintypes.HWND(-1)
+        _HWND_NOTOPMOST = _wintypes.HWND(-2)
+        _SWP_NOMOVE = 0x0002
+        _SWP_NOSIZE = 0x0001
+        _SWP_NOACTIVATE = 0x0010
+
+        _EnumWindowsProc = _ctypes.WINFUNCTYPE(
+            _wintypes.BOOL, _wintypes.HWND, _wintypes.LPARAM)
+
+        _EnumWindows = _user32.EnumWindows
+        _EnumWindows.argtypes = [_EnumWindowsProc, _wintypes.LPARAM]
+        _EnumWindows.restype = _wintypes.BOOL
+
+        _GetWindowTextLengthW = _user32.GetWindowTextLengthW
+        _GetWindowTextLengthW.argtypes = [_wintypes.HWND]
+        _GetWindowTextLengthW.restype = _ctypes.c_int
+
+        _GetWindowTextW = _user32.GetWindowTextW
+        _GetWindowTextW.argtypes = [
+            _wintypes.HWND, _wintypes.LPWSTR, _ctypes.c_int]
+        _GetWindowTextW.restype = _ctypes.c_int
+
+        _IsWindowVisible = _user32.IsWindowVisible
+        _IsWindowVisible.argtypes = [_wintypes.HWND]
+        _IsWindowVisible.restype = _wintypes.BOOL
+
+        _GetWindowLongPtrW = _user32.GetWindowLongPtrW
+        _GetWindowLongPtrW.argtypes = [_wintypes.HWND, _ctypes.c_int]
+        _GetWindowLongPtrW.restype = _ctypes.c_ssize_t
+
+        _SetWindowLongPtrW = _user32.SetWindowLongPtrW
+        _SetWindowLongPtrW.argtypes = [
+            _wintypes.HWND, _ctypes.c_int, _ctypes.c_ssize_t]
+        _SetWindowLongPtrW.restype = _ctypes.c_ssize_t
+
+        _SetLayeredWindowAttributes = _user32.SetLayeredWindowAttributes
+        _SetLayeredWindowAttributes.argtypes = [
+            _wintypes.HWND, _wintypes.COLORREF,
+            _wintypes.BYTE, _wintypes.DWORD]
+        _SetLayeredWindowAttributes.restype = _wintypes.BOOL
+
+        _SetWindowPos = _user32.SetWindowPos
+        _SetWindowPos.argtypes = [
+            _wintypes.HWND, _wintypes.HWND,
+            _ctypes.c_int, _ctypes.c_int,
+            _ctypes.c_int, _ctypes.c_int, _wintypes.UINT]
+        _SetWindowPos.restype = _wintypes.BOOL
+    except Exception:
+        _user32 = None
+
+
+def _find_overlay_window():
+    """Find the browser window currently showing the flurry overlay
+    (`/overlay`). Browsers append their app name to the page title:
+      - Firefox: 'Flurry — Live — Mozilla Firefox'
+      - Edge:    'Flurry — Live - Microsoft Edge'
+      - Chrome:  'Flurry — Live - Google Chrome'
+    so we substring-match on 'Flurry — Live' (and the hyphen variant
+    in case any browser transcribes the em-dash). Returns the first
+    visible match's HWND, or None."""
+    if _user32 is None:
+        return None
+    found: List = []
+
+    @_EnumWindowsProc
+    def callback(hwnd, lparam):
+        if not _IsWindowVisible(hwnd):
+            return True
+        length = _GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return True
+        buf = _ctypes.create_unicode_buffer(length + 1)
+        _GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value
+        if 'Flurry — Live' in title or 'Flurry - Live' in title:
+            found.append(hwnd)
+        return True  # continue enumeration
+
+    _EnumWindows(callback, 0)
+    return found[0] if found else None
+
+
+def _pin_overlay_window(alpha: int = 255) -> bool:
+    """Apply always-on-top + click-through to the overlay browser
+    window. `alpha` is 0-255 (255 = fully opaque). Returns True if the
+    window was found and styles were applied."""
+    if _user32 is None:
+        return False
+    hwnd = _find_overlay_window()
+    if hwnd is None:
+        return False
+    # Add WS_EX_LAYERED (required for click-through to work) and
+    # WS_EX_TRANSPARENT (mouse events pass through to whatever's
+    # underneath — typically the EQ window).
+    current = _GetWindowLongPtrW(hwnd, _GWL_EXSTYLE)
+    new_style = current | _WS_EX_LAYERED | _WS_EX_TRANSPARENT
+    _SetWindowLongPtrW(hwnd, _GWL_EXSTYLE, new_style)
+    # Required after setting WS_EX_LAYERED — without an alpha attr the
+    # window can paint as fully transparent (invisible). 255 = opaque.
+    _SetLayeredWindowAttributes(
+        hwnd, 0, max(0, min(255, alpha)), _LWA_ALPHA)
+    # Always-on-top via HWND_TOPMOST. SWP_NOMOVE/NOSIZE preserve the
+    # user's position/size; SWP_NOACTIVATE doesn't steal focus.
+    _SetWindowPos(hwnd, _HWND_TOPMOST, 0, 0, 0, 0,
+                  _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE)
+    return True
+
+
+def _unpin_overlay_window() -> bool:
+    """Remove always-on-top + click-through from the overlay window
+    (revert to a normal browser window). Returns True if the window
+    was found."""
+    if _user32 is None:
+        return False
+    hwnd = _find_overlay_window()
+    if hwnd is None:
+        return False
+    current = _GetWindowLongPtrW(hwnd, _GWL_EXSTYLE)
+    new_style = current & ~(_WS_EX_LAYERED | _WS_EX_TRANSPARENT)
+    _SetWindowLongPtrW(hwnd, _GWL_EXSTYLE, new_style)
+    _SetWindowPos(hwnd, _HWND_NOTOPMOST, 0, 0, 0, 0,
+                  _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE)
+    return True
+
+
+# ----- Native file dialog (server-side OS picker) -----
+#
+# Browsers don't expose a picked file's disk path to JS — for security
+# reasons, `<input type="file">` only gives the front-end the file's
+# CONTENT and basename. That's why the existing "Upload" path copies
+# the bytes to a temp dir and follows the static copy.
+#
+# To give users the standard "Browse via OS file dialog AND track the
+# original file live" flow, we open the dialog server-side via Tk and
+# get the path that way. tkinter is in Python's stdlib, comes along
+# in the PyInstaller bundle automatically, and renders the same
+# Windows file picker any other app does.
+try:
+    import tkinter as _tk
+    from tkinter import filedialog as _tk_fd
+    _TK_AVAILABLE = True
+except ImportError:
+    _TK_AVAILABLE = False
+
+# Serialize dialog opens so multiple concurrent requests don't fight
+# over Tk state. In practice the user opens at most one dialog at a
+# time but defensive coding here is cheap.
+_native_dialog_lock = threading.Lock()
+
+
+def _native_file_picker(initial_dir: Optional[str] = None) -> Optional[str]:
+    """Open the OS native file-picker dialog (Tk-driven) and return
+    the user's selected path, or None if the dialog was cancelled or
+    Tk is unavailable. Synchronous — blocks the calling thread until
+    the user picks a file or dismisses the dialog."""
+    if not _TK_AVAILABLE:
+        return None
+    with _native_dialog_lock:
+        root = _tk.Tk()
+        try:
+            # Hide the empty Tk window — we only want the dialog.
+            root.withdraw()
+            # Force the dialog above other windows (the browser is
+            # often the active window when this is invoked).
+            root.attributes('-topmost', True)
+            picked = _tk_fd.askopenfilename(
+                parent=root,
+                initialdir=initial_dir,
+                title='Open EQ log',
+                filetypes=[
+                    ('EQ log files', 'eqlog_*.txt'),
+                    ('Text files', '*.txt'),
+                    ('All files', '*.*'),
+                ],
+            )
+        finally:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+    # askopenfilename returns '' on cancel.
+    return picked if picked else None
+
+
 from .sidecar import (
     Sidecar, fight_key, load_sidecar, save_sidecar,
 )
@@ -780,6 +995,357 @@ def _diff_payload(enc_a: Encounter, enc_b: Encounter,
     }
 
 
+# ----- Live snapshot helpers -----
+#
+# Player identity in EQ logs has four context-dependent forms:
+#   - 'You'      — first-person attacker ("You slash X")
+#   - 'YOU'      — defender, all caps ("X hits YOU")
+#   - 'you'      — heal target ("Emberlight healed you")
+#   - 'yourself' — self-heal target ("You healed yourself")
+# `char_name` from the logfile basename (`eqlog_<char>_<server>.txt`)
+# is the cosmetic third-person name; it doesn't appear in first-person
+# attribution. The `_is_you` helper normalizes all four.
+
+_EQLOG_NAME_RE = re.compile(r'^eqlog_([A-Za-z]+)_', re.IGNORECASE)
+_PLAYER_ALIASES = {'you', 'yourself'}
+
+
+def _parse_char_name(logfile_path: Optional[str]) -> Optional[str]:
+    if not logfile_path:
+        return None
+    m = _EQLOG_NAME_RE.match(os.path.basename(logfile_path))
+    return m.group(1) if m else None
+
+
+def _is_you(name: str) -> bool:
+    return name.lower() in _PLAYER_ALIASES
+
+
+def _is_your_pet(name: str, char_name: Optional[str]) -> bool:
+    """Match attackers belonging to the logging player. Assumes
+    `apply_pet_owners()` has been run on the fights upstream — after
+    that pass, all of the player's pets (necro / beastlord backtick
+    form like 'Hacral`s pet' AND mage / charmed pets remapped via the
+    sidecar's pet_owners) carry the unified `<owner>`s pet` name. So
+    this just compares the name's prefix to the char name parsed from
+    the logfile basename.
+
+    Limitation: EQ logs don't include instance IDs, so two pets with
+    the same name in the same group (rare but possible) collapse onto
+    one attribution. Same applies if a charmed mob shares its name
+    with an enemy mob in the same encounter. Both are accepted as
+    known limitations of the log format."""
+    if not char_name:
+        return False
+    name_lower = name.lower()
+    suffix = '`s pet'
+    if not name_lower.endswith(suffix):
+        return False
+    return name_lower[:-len(suffix)] == char_name.lower()
+
+
+def _player_metrics(fight: FightResult, heals_in_window: List[Heal],
+                    char_name: Optional[str] = None) -> dict:
+    """Aggregate the four overlay counters (damage out/in, healing out/in)
+    for the logging player from a single fight + the heals scoped to
+    that fight's time window. Rate fields are per-second.
+
+    `damage_out` rolls in the player's pets — necro/beastlord pets are
+    auto-named `<char>`s pet` by EQ; mage/charmed pets need a sidecar
+    pet_owners entry (set via the encounter detail's Pet owners button)
+    so `apply_pet_owners` rewrites their attacker name to the same
+    canonical form. `damage_in` / healing stay player-only — pet
+    health tracking would be useful but isn't what raid leaders look
+    at on the player's overlay.
+    """
+    duration = max(fight.duration_seconds or 1.0, 1.0)
+
+    def _is_player_or_pet(atk):
+        return _is_you(atk) or _is_your_pet(atk, char_name)
+
+    damage_out = sum(s.damage for atk, s in fight.stats_by_attacker.items()
+                     if _is_player_or_pet(atk))
+    damage_in = sum(d.damage_taken for (_, defender), d
+                    in fight.defends_by_pair.items()
+                    if _is_you(defender))
+    healing_out = sum(h.amount for h in heals_in_window if _is_you(h.healer))
+    healing_in = sum(h.amount for h in heals_in_window if _is_you(h.target))
+    return {
+        'damage_out':  damage_out,
+        'dps_out':     round(damage_out / duration),
+        'damage_in':   damage_in,
+        'dtps_in':     round(damage_in / duration),
+        'healing_out': healing_out,
+        'hps_out':     round(healing_out / duration),
+        'healing_in':  healing_in,
+        'hps_in':      round(healing_in / duration),
+        # HP delta = healing received minus damage taken, per second.
+        # Positive = net heal, negative = net loss. Drives the green/red
+        # indicator in the overlay.
+        'hp_delta_per_sec': round((healing_in - damage_in) / duration),
+    }
+
+
+def _top_damage(fight: FightResult, n: int = 8,
+                char_name: Optional[str] = None) -> List[dict]:
+    """Top-N damage dealers in the fight, sorted desc. Used by the
+    overlay's recap state and by the clipboard copy.
+
+    Each row carries `is_you` and `is_your_pet` flags so the front-end
+    can style the player's own contributions distinctly (player +
+    their pets get highlighted; everyone else's pet rolls up to its
+    owner via apply_pet_owners upstream)."""
+    total = fight.total_damage or 1
+    duration = max(fight.duration_seconds or 1.0, 1.0)
+    rows = []
+    for s in sorted(fight.stats_by_attacker.values(),
+                    key=lambda x: x.damage, reverse=True):
+        if s.damage <= 0:
+            continue
+        # Skip the boss/adds (enemies). Cheap heuristic that works for
+        # the typical raid log: the target is exactly one of the
+        # attackers we want to exclude. Friendlies vs enemies is the
+        # encounter-detail rule but it requires aggregate state we
+        # don't want to recompute on every fast poll; the target-name
+        # exclusion catches the vast majority.
+        if s.attacker.lower() == fight.target.lower():
+            continue
+        rows.append({
+            'name':       s.attacker,
+            'damage':     s.damage,
+            'dps':        round(s.damage / duration),
+            'pct':        round(s.damage / total * 100, 1),
+            'is_you':     _is_you(s.attacker),
+            'is_your_pet': _is_your_pet(s.attacker, char_name),
+        })
+        if len(rows) >= n:
+            break
+    return rows
+
+
+def _top_healing(heals: List[Heal], duration: float, n: int = 5) -> List[dict]:
+    duration = max(duration or 1.0, 1.0)
+    by_healer: dict = {}
+    for h in heals:
+        rec = by_healer.setdefault(h.healer, {'name': h.healer,
+                                              'healing': 0,
+                                              'is_you': _is_you(h.healer)})
+        rec['healing'] += h.amount
+    rows = sorted(by_healer.values(), key=lambda x: x['healing'],
+                  reverse=True)[:n]
+    for r in rows:
+        r['hps'] = round(r['healing'] / duration)
+    return rows
+
+
+def _live_last_encounter(encounters: List[Encounter],
+                         all_heals: List[Heal],
+                         char_name: Optional[str] = None) -> Optional[dict]:
+    """Recap of the most recent completed encounter. Used in the
+    overlay's no-active-fight state. Falls back to the latest fight if
+    grouping isn't available (shouldn't happen in normal flow)."""
+    if not encounters:
+        return None
+    # Most-recent encounter by end time (some encounters can run long
+    # while a quick trash kill encounter ends after — sort by `end`).
+    e = max(encounters, key=lambda x: x.end or datetime.min)
+    flat = merge_encounter(e)
+    # Heals scoped to encounter window. Encounter.heals is already
+    # populated by group_into_encounters but the overlay's player
+    # metrics need the same shape as the active-fight path.
+    heals_window = list(e.heals)
+    return {
+        'encounter_id':       e.encounter_id,
+        'name':               _encounter_summary(e)['name'],
+        'start':              e.start.strftime('%Y-%m-%d %H:%M:%S') if e.start else None,
+        'end':                e.end.strftime('%Y-%m-%d %H:%M:%S') if e.end else None,
+        'duration_seconds':   round(e.duration_seconds, 1),
+        'fight_complete':     e.fight_complete,
+        'raid_total_damage':  e.total_damage,
+        'you':                _player_metrics(flat, heals_window,
+                                              char_name=char_name),
+        'top_damage':         _top_damage(flat, n=8, char_name=char_name),
+        'top_healing':        _top_healing(heals_window,
+                                           e.duration_seconds, n=5),
+    }
+
+
+def _live_snapshot_payload() -> dict:
+    """Build the live-overlay payload. Acquires the lock briefly to
+    snapshot detector state, then releases before doing the (purely
+    Python) computation work — keeps the follower thread unblocked."""
+    char_name = _parse_char_name(_State.logfile)
+    follower = _State.live_follower
+    follower_running = follower is not None and follower.is_running()
+    base = {
+        'live_enabled':     _State.live_enabled,
+        'follower_running': follower_running,
+        'logfile_basename': (os.path.basename(_State.logfile)
+                             if _State.logfile else None),
+        'char_name':        char_name,
+        'last_event_ts':    None,
+        'active_fight':     None,
+        'last_encounter':   None,
+    }
+    if _State.logfile is None or _State.detector is None:
+        return base
+
+    # Snapshot the detector state under the lock. We finalize the
+    # in-progress fight via _live_active_fight; we group the completed
+    # fights via group_into_encounters for the recap. Both are read-only
+    # ops on the detector but we hold the lock to ensure consistency.
+    with _State.fights_lock:
+        detector = _State.detector
+        if detector is None:
+            return base
+        last_event = detector.last_event_ts
+        # Snapshot copies. detector.heals and detector.completed are
+        # lists; copy them so we can compute outside the lock if we
+        # later want to (currently we hold the lock for simplicity).
+        all_heals = list(detector.heals)
+        completed = list(detector.completed)
+        in_progress_copy = dict(detector.in_progress)
+
+        # Read the sidecar's pet_owners map up front — used to roll
+        # mage / charmed pets onto their owner across both the active
+        # fight and the recap. The encounter detail's "Pet owners"
+        # editor populates this; for necro/beastlord pets that EQ
+        # already names `<owner>`s pet`, no entry is needed (the
+        # parser already attributes correctly).
+        sidecar_for_pets = _State.sidecar or Sidecar.empty()
+        pet_owners_map = sidecar_for_pets.pet_owners or {}
+
+        # Active fight: pick the most-recent ENEMY fight (target isn't
+        # the player or a pet) — the analyzer creates a separate fight
+        # per defender, so when a boss hits the player there's both a
+        # boss fight (target='a sim grabber') AND a YOU fight (target=
+        # 'YOU'). The user wants to see the boss as the engagement.
+        # Suppressed when live mode is off (user is reviewing static
+        # history, not actively fighting).
+        active = None
+        if in_progress_copy and _State.live_enabled:
+            # Snapshot ALL in-progress builders to FightResults first so
+            # apply_pet_owners can rewrite them uniformly. After this,
+            # all of the player's pets (necro/beastlord backtick form
+            # AND mage/charmed pets via the sidecar) carry the unified
+            # `<owner>`s pet` name, so _is_your_pet just checks the
+            # name prefix.
+            in_progress_snapshots = [
+                b.finalize(b.last_ts, fight_complete=False)
+                for b in in_progress_copy.values()
+            ]
+            if pet_owners_map:
+                in_progress_snapshots, _ = apply_pet_owners(
+                    in_progress_snapshots, [], pet_owners_map)
+
+            enemy_fights = [
+                f for f in in_progress_snapshots
+                if not _is_you(f.target)
+                and not f.target.endswith('`s pet')
+            ]
+            if enemy_fights:
+                # Pick the most-recent enemy fight as the displayed
+                # target. (Multi-mob aware grouping was an earlier
+                # planned improvement; for now show the most recently
+                # active enemy.)
+                primary = max(enemy_fights, key=lambda f: f.end or f.start)
+                window_start = min(f.start for f in in_progress_snapshots)
+                window_end = max((f.end or f.start) for f in in_progress_snapshots)
+                window_dur = max((window_end - window_start).total_seconds(), 1.0)
+                heals_window = [h for h in all_heals
+                                if window_start <= h.timestamp <= window_end]
+                # Player + their pets aggregated across all in-progress
+                # fights (so dmg-out on the boss fight + dmg-in on the
+                # YOU fight + pet damage on the boss fight all roll up
+                # to one set of headline counters).
+                def _player_or_pet(atk):
+                    return _is_you(atk) or _is_your_pet(atk, char_name)
+                damage_out = 0
+                damage_in = 0
+                for f in in_progress_snapshots:
+                    damage_out += sum(s.damage
+                                      for atk, s in f.stats_by_attacker.items()
+                                      if _player_or_pet(atk))
+                    damage_in += sum(d.damage_taken
+                                     for (_, defender), d
+                                     in f.defends_by_pair.items()
+                                     if _is_you(defender))
+                healing_out = sum(h.amount for h in heals_window if _is_you(h.healer))
+                healing_in = sum(h.amount for h in heals_window if _is_you(h.target))
+                you_metrics = {
+                    'damage_out':  damage_out,
+                    'dps_out':     round(damage_out / window_dur),
+                    'damage_in':   damage_in,
+                    'dtps_in':     round(damage_in / window_dur),
+                    'healing_out': healing_out,
+                    'hps_out':     round(healing_out / window_dur),
+                    'healing_in':  healing_in,
+                    'hps_in':      round(healing_in / window_dur),
+                    'hp_delta_per_sec': round((healing_in - damage_in) / window_dur),
+                }
+                active = {
+                    'target':             primary.target,
+                    'start':              primary.start.strftime('%Y-%m-%d %H:%M:%S'),
+                    'duration_seconds':   round(primary.duration_seconds, 1),
+                    'raid_total_damage':  primary.total_damage,
+                    'you':                you_metrics,
+                    'top_damage':         _top_damage(primary, n=8,
+                                                      char_name=char_name),
+                    'top_healing':        _top_healing(heals_window,
+                                                       window_dur, n=5),
+                }
+
+        # Last encounter for recap. Always re-derive from the detector's
+        # completed fights — the cached `_State.encounters` was built at
+        # initial-parse time and doesn't include fights the follower has
+        # closed since. Re-grouping is cheap (linear in completed
+        # fights). Apply pet owners + manual groups the same way the
+        # main UI does so the recap names match.
+        sidecar = _State.sidecar or Sidecar.empty()
+        if sidecar.pet_owners:
+            fights2, heals2 = apply_pet_owners(
+                completed, all_heals, sidecar.pet_owners)
+        else:
+            fights2, heals2 = completed, all_heals
+        encounters = group_into_encounters(
+            fights2,
+            gap_seconds=_State.encounter_gap_seconds,
+            heals=heals2,
+            manual_groups=sidecar.manual_groups_for_grouper())
+        last_enc = _live_last_encounter(encounters, all_heals,
+                                        char_name=char_name)
+
+        # Debug counters to diagnose "live tail not working" reports —
+        # these surface in /api/live/snapshot so the user can compare
+        # follower position to file size and see if events are landing.
+        try:
+            file_size = (os.path.getsize(_State.logfile)
+                         if _State.logfile and os.path.isfile(_State.logfile)
+                         else 0)
+        except OSError:
+            file_size = 0
+        debug = {
+            # Full path flurry is following. Drag-drop copies the file
+            # to %TEMP%\flurry-uploads\... and follows the COPY (which
+            # doesn't grow as EQ writes); Browse / paste-path follows
+            # the original. If this isn't the path EQ is writing to,
+            # that's the entire reason live tail looks frozen.
+            'logfile_path':       _State.logfile,
+            'file_size_bytes':    file_size,
+            'follower_position':  _State.live_position,
+            'bytes_behind':       max(0, file_size - _State.live_position),
+            'in_progress_fights': len(in_progress_copy),
+            'completed_fights':   len(completed),
+            'total_heal_events':  len(all_heals),
+        }
+
+    base['last_event_ts'] = last_event.strftime('%Y-%m-%d %H:%M:%S') if last_event else None
+    base['active_fight'] = active
+    base['last_encounter'] = last_enc
+    base['debug'] = debug
+    return base
+
+
 # ----- Request handler -----
 
 class _State:
@@ -820,6 +1386,22 @@ class _State:
     comparison_heals: Optional[List[Heal]] = None
     comparison_encounters: Optional[List[Encounter]] = None
     comparison_sidecar: Optional[Sidecar] = None
+    # ----- Live mode -----
+    # When `live_enabled` is True and a log is loaded, the follower thread
+    # holds the file open at `live_position` and polls every `poll_ms` for
+    # new bytes. New events get parsed and fed into the long-lived
+    # `detector`, which is what the live-snapshot endpoint reads. Default
+    # ON when a log loads — typically you're loading a log that's still
+    # being written to during a raid; users reviewing historical logs can
+    # toggle off via the header. The detector survives across param
+    # changes (since detection params change the slicing of the same
+    # event stream, not the events themselves — though we currently do a
+    # full re-walk on param change for simplicity).
+    live_enabled: bool = True
+    live_poll_ms: int = 250
+    detector: Optional['_CombatDetector'] = None
+    live_position: int = 0  # byte offset in logfile the follower has reached
+    live_follower: Optional['_LiveFollower'] = None
     # Parse-progress dict, updated periodically by the parser thread and
     # read lock-free by /api/parse-status. State machine:
     #   'idle'    — no parse in progress; pct meaningless.
@@ -873,17 +1455,25 @@ def _ensure_combat_cached():
     """Walk the log once to populate fights + heals if not already cached.
     Caller must hold `_State.fights_lock`.
 
-    `_State.fights` and `_State.heals` are deliberately the RAW outputs
-    of `detect_combat` (no pet-owner rewrite). Rewriting happens later
-    in `_get_encounters_locked` so the raw attacker names stay visible
-    for the pet-owner edit modal. The cost is one extra pass per
-    sidecar edit; we trade a little CPU for a much simpler edit flow.
+    Builds a long-lived `_CombatDetector` on `_State.detector` so live
+    mode's follower thread can continue feeding events into the same
+    accumulator after the initial walk. `_State.fights` and
+    `_State.heals` are snapshotted from the detector here and stay
+    static until the next invalidation — Phase 1 doesn't auto-refresh
+    them between snapshots; the live overlay reads the detector
+    directly via /api/live/snapshot.
 
-    During the parse we update `_State.parse_progress` periodically so a
-    concurrent /api/parse-status request can show a live progress bar.
-    Sidecar edits don't trigger a re-parse (they only invalidate the
-    encounter cache), so the progress bar is only relevant on the first
-    load + reload + param change paths."""
+    `_State.fights` and `_State.heals` are deliberately the RAW outputs
+    of the detector (no pet-owner rewrite). Rewriting happens later in
+    `_get_encounters_locked` so the raw attacker names stay visible for
+    the pet-owner edit modal. The cost is one extra pass per sidecar
+    edit; we trade a little CPU for a much simpler edit flow.
+
+    During the parse we update `_State.parse_progress` periodically so
+    a concurrent /api/parse-status request can show a live progress
+    bar. Sidecar edits don't trigger a re-parse (they only invalidate
+    the encounter cache), so the progress bar is only relevant on the
+    first load + reload + param change paths."""
     if _State.fights is not None and _State.heals is not None:
         return
     since = _resolve_since_locked()
@@ -894,21 +1484,212 @@ def _ensure_combat_cached():
         _set_progress('parsing', bytes_read=bytes_read,
                       total_bytes=total_bytes)
 
+    detector = _CombatDetector(
+        gap_seconds=_State.gap_seconds,
+        min_damage=_State.min_damage,
+        min_duration_seconds=_State.min_duration_seconds,
+        heals_extend_fights=_State.heals_extend_fights,
+    )
     try:
-        fights, heals = detect_combat(
-            _State.logfile,
-            gap_seconds=_State.gap_seconds,
-            min_damage=_State.min_damage,
-            min_duration_seconds=_State.min_duration_seconds,
-            heals_extend_fights=_State.heals_extend_fights,
-            since=since,
-            progress_cb=_on_progress)
+        end_pos = walk_into_detector(
+            _State.logfile, detector,
+            since=since, progress_cb=_on_progress,
+        )
     except Exception as e:
         _set_progress('error', total_bytes=total, message=f'{type(e).__name__}: {e}')
         raise
+    # IMPORTANT: don't finalize_all() here — that would close every
+    # in-progress fight unconditionally, which is wrong when the live
+    # follower is about to extend the detector. We DO run expire_stale()
+    # so fights that have actually been quiet for >gap_seconds (typical
+    # for static / historical logs) close cleanly. Genuinely-active
+    # fights (within gap_seconds of the last event) stay open for the
+    # follower to extend with new events.
+    detector.expire_stale()
+    fights, heals = detector.snapshot(include_in_progress=False)
+    _State.detector = detector
+    _State.live_position = end_pos
     _State.fights = fights
     _State.heals = heals
     _set_progress('done', bytes_read=total, total_bytes=total)
+    # Kick off the live follower if live mode is enabled. The follower
+    # picks up at `live_position` (end of the initial walk) and keeps
+    # the detector alive across appended events. Caller already holds
+    # the lock; _start_live_follower_locked is a no-op if a follower is
+    # already running for this log.
+    _start_live_follower_locked()
+
+
+# ----- Live follower thread -----
+#
+# A background thread that holds the active log open at a known byte
+# position and polls every ~250ms for newly-appended bytes. Anything new
+# is parsed and fed into `_State.detector`, extending fights and heals
+# in place. The live-snapshot endpoint reads the detector at request
+# time so the polling overlay sees the latest state.
+#
+# Lifecycle: started by `_set_logfile` when `_State.live_enabled` is
+# True (after the initial parse populates the detector); stopped on log
+# swap, log clear, or live-mode toggle off. Lock-coordinated with the
+# rest of the server via `_State.fights_lock` — every batch of new
+# events is fed into the detector under the lock.
+
+class _LiveFollower:
+    """Background thread that tails the active log and feeds new events
+    into the shared `_CombatDetector`.
+
+    Reads via plain `open(path, 'rb')` each tick. (An earlier version
+    chased a phantom Windows file-cache bug that turned out to be
+    misdiagnosis: the user was loading via /api/upload, which copies
+    to a temp dir and follows a static copy. Once /api/open / native
+    Browse landed, the simple Python read path proved correct.)"""
+
+    def __init__(self, logfile: str, poll_interval_s: float = 0.25):
+        self.logfile = logfile
+        self.poll_interval_s = poll_interval_s
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name='flurry-live-follower', daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 1.0):
+        self._stop.set()
+        t = self._thread
+        if t is not None:
+            t.join(timeout=timeout)
+        self._thread = None
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def _run(self):
+        # Loop: read new bytes from the current position, parse complete
+        # lines, feed events into the detector under the lock. Sleep
+        # `poll_interval_s` between passes. Errors are logged and the
+        # loop continues — a transient read failure shouldn't kill
+        # live mode.
+        from .parser import parse_line
+        while not self._stop.is_set():
+            try:
+                self._tick(parse_line)
+            except Exception:
+                # Quietly skip bad ticks. A persistent error shows up as
+                # the snapshot timestamp going stale, which the UI
+                # surfaces as the indicator dimming.
+                pass
+            # Wait with wake-up support so stop() returns quickly.
+            self._stop.wait(self.poll_interval_s)
+
+    def _tick(self, parse_line):
+        # Read newly-appended bytes from `live_position` to EOF. Open
+        # afresh each tick so a log rotation (file replaced) doesn't
+        # strand us on a stale handle.
+        if not os.path.isfile(self.logfile):
+            return
+        size = os.path.getsize(self.logfile)
+        with _State.fights_lock:
+            # Per-tick guards: if a different logfile is now active or
+            # we've been replaced as the current follower, this thread
+            # is an orphan from a swap — exit without touching state.
+            # Together with the daemon-thread / stop-flag semantics,
+            # this lets `_stop_live_follower_locked` be non-blocking
+            # (just set the flag and clear the slot; we'll notice).
+            if (_State.logfile != self.logfile
+                    or _State.live_follower is not self):
+                self._stop.set()
+                return
+            position = _State.live_position
+            detector = _State.detector
+            if detector is None:
+                return
+            has_new_bytes = position < size
+        # Read outside the lock (I/O can be slow); decode + parse
+        # without touching shared state. Falls through to the
+        # wall-clock expire_stale at the end even if there are no new
+        # bytes, so phantom in-progress fights still close after
+        # gap_seconds of real-world idle.
+        chunk = b''
+        if has_new_bytes:
+            try:
+                with open(self.logfile, 'rb') as f:
+                    f.seek(position)
+                    chunk = f.read(size - position)
+            except OSError:
+                chunk = b''
+        if chunk:
+            try:
+                text = chunk.decode('utf-8', errors='replace')
+            except UnicodeDecodeError:
+                text = chunk.decode('latin-1', errors='replace')
+            # EQ logs are line-buffered so chunks should end on \n; if
+            # the writer is mid-line, leave the trailing partial line
+            # for the next tick.
+            last_nl = text.rfind('\n')
+            if last_nl >= 0:
+                complete_text = text[:last_nl + 1]
+                consumed_bytes = len(complete_text.encode('utf-8'))
+                with _State.fights_lock:
+                    # Re-check guards + detector existence — anything
+                    # could have changed during the I/O window.
+                    if (_State.logfile != self.logfile
+                            or _State.live_follower is not self):
+                        self._stop.set()
+                        return
+                    detector = _State.detector
+                    if detector is None:
+                        return
+                    for line in complete_text.splitlines():
+                        if not line:
+                            continue
+                        ev = parse_line(line)
+                        if ev is not None:
+                            detector.feed_event(ev)
+                    # Advance position by what we actually consumed
+                    # (may be less than the chunk we read if the chunk
+                    # ended mid-line).
+                    _State.live_position = position + consumed_bytes
+        # Always run expire_stale at end-of-tick with WALL CLOCK as
+        # the anchor — NOT detector.last_event_ts. Without this, when
+        # the log goes idle (player out of combat / EQ paused / zone
+        # quiet), stale in-progress fights never close because the
+        # log-time anchor doesn't advance, and the overlay shows a
+        # phantom "active fight" indefinitely. The static-walk path
+        # is unaffected — finalize_all() handles end-of-walk separately.
+        with _State.fights_lock:
+            if (_State.logfile == self.logfile
+                    and _State.live_follower is self
+                    and _State.detector is not None):
+                _State.detector.expire_stale(now=datetime.now())
+
+
+def _start_live_follower_locked():
+    """Start the live follower for the active log if live is enabled
+    and a follower isn't already running. Caller must hold the lock."""
+    if not _State.live_enabled or _State.logfile is None:
+        return
+    if _State.live_follower is not None and _State.live_follower.is_running():
+        return
+    _State.live_follower = _LiveFollower(
+        _State.logfile,
+        poll_interval_s=max(0.05, _State.live_poll_ms / 1000.0))
+    _State.live_follower.start()
+
+
+def _stop_live_follower_locked():
+    """Signal the live follower to stop and clear the slot. Non-blocking
+    by design — the daemon thread exits within ~poll_interval_s on its
+    next wake; the per-tick guards in _tick() ensure it can't mutate
+    state in the meantime. Caller must hold the lock."""
+    follower = _State.live_follower
+    _State.live_follower = None
+    if follower is not None:
+        follower._stop.set()
 
 
 def _get_fights() -> List[FightResult]:
@@ -962,11 +1743,18 @@ def _set_logfile(path: str):
     if not os.path.isfile(abs_path):
         raise FileNotFoundError(f'log file not found: {abs_path}')
     with _State.fights_lock:
+        # Stop any existing live follower before swapping the logfile
+        # underneath it — the per-tick guards would catch a race, but
+        # signaling stop here lets the orphan exit on its next wake
+        # rather than churning until it notices.
+        _stop_live_follower_locked()
         _State.logfile = abs_path
         _State.fights = None
         _State.heals = None
         _State.encounters = None
         _State.parser_stats = None
+        _State.detector = None
+        _State.live_position = 0
         _State.sidecar = load_sidecar(abs_path)
         _clear_comparison_locked()
     _set_progress('idle')
@@ -984,6 +1772,14 @@ def _invalidate_caches_locked(*, drop_combat: bool = False):
         _State.fights = None
         _State.heals = None
         _State.parser_stats = None
+        # The detector is rebuilt by the next _ensure_combat_cached(),
+        # so drop it here too. Stop the follower so it doesn't try to
+        # extend a stale detector while the re-walk runs; it'll get
+        # restarted at the end of the request handler that triggered
+        # the invalidation.
+        _State.detector = None
+        _State.live_position = 0
+        _stop_live_follower_locked()
         # The next consumer will trigger a fresh parse; reset progress so
         # the UI can show the new run from 0%.
         _set_progress('idle')
@@ -1213,6 +2009,18 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
         try:
             if path in ('/', '/index.html'):
                 self._serve_html(_INDEX_HTML)
+            elif path == '/overlay':
+                # Live-overlay window — separate page from the SPA so it
+                # can be opened in its own browser window with a compact,
+                # borderless layout. It polls /api/live/snapshot and
+                # works even with no log loaded (shows the "load a log
+                # in the main window" empty state) so users can size +
+                # position the window before raid.
+                real = _static_path('overlay.html')
+                if real is None:
+                    self.send_error(500, 'overlay.html not bundled')
+                    return
+                self._serve_static(real)
             elif path.startswith('/static/'):
                 # Front-end assets (CSS, JS, future images) live as files
                 # under flurry/static/ rather than embedded in this module.
@@ -1320,6 +2128,12 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                 # second-log encounter picker can render a session table
                 # before the user picks which encounter to diff against.
                 self._serve_json(self._comparison_session_payload())
+            elif path == '/api/live/snapshot':
+                # Compact live-overlay payload: char name, active fight
+                # (if any) with the player's four counters + top-N
+                # damage/healing rows, plus the last-encounter recap
+                # for the no-active-fight state. Polled at ~250ms.
+                self._serve_json(_live_snapshot_payload())
             elif path == '/api/parse-status':
                 # Lock-free read of the progress dict — single attribute
                 # access, GIL-safe. Polled rapidly by the upload UI to
@@ -1403,6 +2217,35 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                     return
                 _set_logfile(requested)
                 self._serve_json(self._session_payload())
+            elif path == '/api/browse-native':
+                # Server-side native file dialog. Browsers can't give
+                # JS a picked file's disk path, but a Tk file dialog
+                # opened from the Python server runs in the user's
+                # session and returns the path directly. Loads via
+                # _set_logfile (live tracking), unlike /api/upload
+                # which copies to a temp dir.
+                if not _TK_AVAILABLE:
+                    self.send_error(400, 'native file dialog not available '
+                                         '(tkinter import failed)')
+                    return
+                initial_dir = data.get('initial_dir') if data else None
+                try:
+                    picked = _native_file_picker(initial_dir=initial_dir)
+                except Exception as e:
+                    self.send_error(500, f'native dialog failed: '
+                                         f'{type(e).__name__}: {e}')
+                    return
+                if not picked:
+                    # User cancelled. 200 with no path so the front-end
+                    # treats it as a no-op.
+                    self._serve_json({'path': None, 'cancelled': True})
+                    return
+                _set_logfile(picked)
+                self._serve_json({
+                    'path': picked,
+                    'cancelled': False,
+                    'session': self._session_payload(),
+                })
             elif path == '/api/comparison/open':
                 # Load a second log for cross-log diff. Body: {"path":...}.
                 # Requires a primary log already loaded — comparison
@@ -1421,6 +2264,65 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                 with _State.fights_lock:
                     _clear_comparison_locked()
                 self._serve_json({'ok': True})
+            elif path == '/api/overlay/pin':
+                # Apply always-on-top + click-through to the overlay
+                # browser window via Win32. Has to be triggered from
+                # the main UI (not the overlay itself) — once
+                # click-through is on, the overlay can't be clicked.
+                # Optional `alpha` (0-255, default 255 = opaque) lets
+                # the user dim the overlay slightly for some
+                # see-through effect. Mostly cosmetic; primary
+                # purpose is the always-on-top + click-through.
+                if _user32 is None:
+                    self.send_error(400, 'overlay pinning is Windows-only')
+                    return
+                try:
+                    alpha = int(data.get('alpha', 255))
+                except (TypeError, ValueError):
+                    self.send_error(400, 'alpha must be an integer 0-255')
+                    return
+                ok = _pin_overlay_window(alpha=alpha)
+                if not ok:
+                    self.send_error(404, 'overlay window not found; '
+                                         'open it via Pop out overlay first')
+                    return
+                self._serve_json({
+                    'pinned': True,
+                    'alpha': max(0, min(255, alpha)),
+                })
+            elif path == '/api/overlay/unpin':
+                # Revert always-on-top + click-through. Idempotent —
+                # works whether the window is currently pinned or not.
+                if _user32 is None:
+                    self.send_error(400, 'overlay pinning is Windows-only')
+                    return
+                ok = _unpin_overlay_window()
+                self._serve_json({'pinned': False, 'found': ok})
+            elif path == '/api/live/toggle':
+                # Turn the live follower on or off. Body: {"enabled": bool}.
+                # When toggling on with a log loaded, immediately starts
+                # the follower at the current end-of-file position so we
+                # don't double-parse history. When toggling off, signals
+                # the follower to exit on its next poll cycle.
+                want = bool(data.get('enabled', not _State.live_enabled))
+                with _State.fights_lock:
+                    _State.live_enabled = want
+                    if want:
+                        # Pick up from end-of-file if the detector is
+                        # already populated; otherwise the follower
+                        # will start once _ensure_combat_cached() runs.
+                        if (_State.detector is not None
+                                and _State.logfile is not None
+                                and os.path.isfile(_State.logfile)):
+                            _State.live_position = os.path.getsize(_State.logfile)
+                        _start_live_follower_locked()
+                    else:
+                        _stop_live_follower_locked()
+                self._serve_json({
+                    'live_enabled': _State.live_enabled,
+                    'follower_running': (_State.live_follower is not None
+                                         and _State.live_follower.is_running()),
+                })
             elif path == '/api/params':
                 # Update detection / grouping knobs and invalidate caches.
                 # Allowed without a log loaded so the picker can pre-set
