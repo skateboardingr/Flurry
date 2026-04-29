@@ -632,26 +632,23 @@ def _session_summary_payload(encounters: List[Encounter],
     }
 
 
-def _diff_payload(encounters: List[Encounter],
-                  encounter_ids: List[int]) -> Optional[dict]:
+def _diff_payload(enc_a: Encounter, enc_b: Encounter,
+                  log_a: Optional[str] = None,
+                  log_b: Optional[str] = None) -> dict:
     """Two-encounter side-by-side diff.
 
-    Same-log only — pulls two encounters from the active session and
-    returns a parallel per-actor payload. The two metric tabs (damage,
-    tanking, healing) all share a common row shape so the front-end can
-    swap modes through one render path.
+    Builds a parallel per-actor payload over the union of attackers/
+    defenders/healers in both encounters. The three metric tabs (damage,
+    damage taken, healing) all share a common row shape so the front-end
+    swaps modes through one render path.
 
-    Returns None if either id can't be matched (e.g. param change shifted
-    ids since the user made the selection).
+    Same-log mode: callers resolve both encounters from the same
+    `_get_encounters()` list and leave `log_a`/`log_b` as None.
+    Cross-log mode: callers pull `enc_a` from the primary log's
+    encounters, `enc_b` from the comparison log's, and pass each log's
+    basename so the front-end can label the encounter cards.
     """
-    if len(encounter_ids) != 2:
-        return None
-    by_id = {e.encounter_id: e for e in encounters}
-    a = by_id.get(encounter_ids[0])
-    b = by_id.get(encounter_ids[1])
-    if a is None or b is None:
-        return None
-    pair = [a, b]
+    pair = [enc_a, enc_b]
     merged = [merge_encounter(e) for e in pair]
 
     # Side classification — same `received > dealt + healed` rule the
@@ -757,6 +754,7 @@ def _diff_payload(encounters: List[Encounter],
             'values': values,
         })
 
+    log_labels = [log_a, log_b]
     encounter_meta = [{
         'encounter_id': e.encounter_id,
         'name': _encounter_summary(e)['name'],
@@ -766,11 +764,19 @@ def _diff_payload(encounters: List[Encounter],
         'total_damage': e.total_damage,
         'total_healing': e.total_healing,
         'raid_dps': round(e.raid_dps),
-    } for e in pair]
+        'log': log_labels[i],
+    } for i, e in enumerate(pair)]
+
+    # `cross_log` flips the front-end into cross-log presentation (log
+    # filename badge on each encounter card, "Drop comparison log" hint
+    # in the header). True when either label is provided — same-log
+    # callers leave both None and the field stays False.
+    cross_log = bool(log_a or log_b)
 
     return {
         'encounters': encounter_meta,
         'actors': actors,
+        'cross_log': cross_log,
     }
 
 
@@ -802,6 +808,18 @@ class _State:
     # Sidecar state — pet owner assignments + manual encounter overrides.
     # Loaded on _set_logfile, written on every edit endpoint.
     sidecar: Optional[Sidecar] = None
+    # ----- Comparison log (cross-log diff) -----
+    # A second log loaded alongside the primary, used solely for cross-log
+    # diffing. Parsed with the same detection params as primary so the two
+    # are comparable. Read-only from the cross-log diff path — no encounter
+    # editing / merging / sidecar mutation flows through these slots; only
+    # the primary log gets that. Cleared when the primary log changes
+    # (the comparison context loses meaning when the primary swaps).
+    comparison_logfile: Optional[str] = None
+    comparison_fights: Optional[List[FightResult]] = None
+    comparison_heals: Optional[List[Heal]] = None
+    comparison_encounters: Optional[List[Encounter]] = None
+    comparison_sidecar: Optional[Sidecar] = None
     # Parse-progress dict, updated periodically by the parser thread and
     # read lock-free by /api/parse-status. State machine:
     #   'idle'    — no parse in progress; pct meaningless.
@@ -935,7 +953,11 @@ def _set_logfile(path: str):
     """Switch the active log. Validates, resets caches, and loads the
     sidecar (`<logfile>.flurry.json`) if one exists. A missing or
     unreadable sidecar yields an empty one — the file isn't created
-    until the user makes their first edit."""
+    until the user makes their first edit.
+
+    Also drops any comparison log — when the primary swaps, "compare
+    against this other log" loses its meaning, and silently keeping a
+    stale comparison around would be confusing in the diff UI."""
     abs_path = os.path.abspath(os.path.expanduser(path))
     if not os.path.isfile(abs_path):
         raise FileNotFoundError(f'log file not found: {abs_path}')
@@ -946,6 +968,7 @@ def _set_logfile(path: str):
         _State.encounters = None
         _State.parser_stats = None
         _State.sidecar = load_sidecar(abs_path)
+        _clear_comparison_locked()
     _set_progress('idle')
 
 
@@ -972,6 +995,119 @@ def _persist_sidecar_locked():
     if _State.logfile is None or _State.sidecar is None:
         return
     save_sidecar(_State.logfile, _State.sidecar)
+
+
+# ----- Comparison-log helpers (cross-log diff) -----
+#
+# Mirror the primary-log lifecycle (set / parse / get-encounters / clear)
+# against the `comparison_*` slots. Detection params come from the same
+# `_State` fields the primary uses so encounters detected in both logs
+# are directly comparable. Pet owners apply per-log via each log's own
+# sidecar; manual encounter groupings likewise.
+#
+# These never mutate `_State.parse_progress` — comparison loads share the
+# primary's progress dict so the existing UI progress bar keeps working
+# without the front-end having to know about a parallel parse stream.
+
+
+def _resolve_comparison_since_locked() -> Optional[datetime]:
+    """`since_hours` cutoff anchored to the comparison log's last
+    timestamp (NOT the primary's). Each log gets its own slice. Caller
+    must hold `_State.fights_lock`."""
+    if _State.since_hours <= 0 or _State.comparison_logfile is None:
+        return None
+    last = read_last_timestamp(_State.comparison_logfile)
+    if last is None:
+        return None
+    return last - timedelta(hours=_State.since_hours)
+
+
+def _ensure_comparison_combat_cached():
+    """Walk the comparison log and populate fights+heals if not cached.
+    Caller must hold `_State.fights_lock`. Same shape as
+    `_ensure_combat_cached` but operates on the comparison slots."""
+    if (_State.comparison_fights is not None
+            and _State.comparison_heals is not None):
+        return
+    since = _resolve_comparison_since_locked()
+    total = (os.path.getsize(_State.comparison_logfile)
+             if os.path.isfile(_State.comparison_logfile) else 0)
+    _set_progress('parsing', bytes_read=0, total_bytes=total)
+
+    def _on_progress(bytes_read: int, total_bytes: int):
+        _set_progress('parsing', bytes_read=bytes_read,
+                      total_bytes=total_bytes)
+
+    try:
+        fights, heals = detect_combat(
+            _State.comparison_logfile,
+            gap_seconds=_State.gap_seconds,
+            min_damage=_State.min_damage,
+            min_duration_seconds=_State.min_duration_seconds,
+            heals_extend_fights=_State.heals_extend_fights,
+            since=since,
+            progress_cb=_on_progress)
+    except Exception as e:
+        _set_progress('error', total_bytes=total,
+                      message=f'{type(e).__name__}: {e}')
+        raise
+    _State.comparison_fights = fights
+    _State.comparison_heals = heals
+    _set_progress('done', bytes_read=total, total_bytes=total)
+
+
+def _get_comparison_encounters_locked() -> List[Encounter]:
+    """Build comparison encounters with the comparison log's sidecar
+    applied (pet owners + manual groups). Caller must hold the lock."""
+    if _State.comparison_logfile is None:
+        return []
+    _ensure_comparison_combat_cached()
+    if _State.comparison_encounters is None:
+        sidecar = _State.comparison_sidecar or Sidecar.empty()
+        if sidecar.pet_owners:
+            fights, heals = apply_pet_owners(
+                _State.comparison_fights, _State.comparison_heals,
+                sidecar.pet_owners)
+        else:
+            fights, heals = (_State.comparison_fights,
+                             _State.comparison_heals)
+        _State.comparison_encounters = group_into_encounters(
+            fights,
+            gap_seconds=_State.encounter_gap_seconds,
+            heals=heals,
+            manual_groups=sidecar.manual_groups_for_grouper())
+    return _State.comparison_encounters
+
+
+def _get_comparison_encounters() -> List[Encounter]:
+    with _State.fights_lock:
+        return _get_comparison_encounters_locked()
+
+
+def _set_comparison_logfile(path: str):
+    """Load a second log for cross-log diff. Validates, resets the
+    comparison caches, and loads the comparison log's sidecar so its
+    pet-owner assignments apply when grouping its encounters."""
+    abs_path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(abs_path):
+        raise FileNotFoundError(f'log file not found: {abs_path}')
+    with _State.fights_lock:
+        _State.comparison_logfile = abs_path
+        _State.comparison_fights = None
+        _State.comparison_heals = None
+        _State.comparison_encounters = None
+        _State.comparison_sidecar = load_sidecar(abs_path)
+    _set_progress('idle')
+
+
+def _clear_comparison_locked():
+    """Drop the comparison log and all its derived caches. Caller must
+    hold `_State.fights_lock`."""
+    _State.comparison_logfile = None
+    _State.comparison_fights = None
+    _State.comparison_heals = None
+    _State.comparison_encounters = None
+    _State.comparison_sidecar = None
 
 
 # Filenames are sanitized to a safe subset before being written to the
@@ -1126,9 +1262,9 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                     encounters, killed_only=killed_only,
                     encounter_ids=encounter_ids))
             elif path == '/api/diff':
-                # Two-encounter side-by-side diff. Same-log only (the
-                # session is already loaded; both ids resolve against
-                # `_get_encounters()`). Query: ?ids=A,B (exactly 2).
+                # Two-encounter side-by-side diff (same log). Both ids
+                # resolve against the active session's encounters.
+                # Query: ?ids=A,B (exactly 2).
                 ids_raw = qs.get('ids', [''])[0]
                 try:
                     ids = [int(s) for s in ids_raw.split(',') if s.strip()]
@@ -1138,12 +1274,52 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                 if len(ids) != 2:
                     self.send_error(400, 'diff needs exactly 2 encounter ids')
                     return
-                payload = _diff_payload(_get_encounters(), ids)
-                if payload is None:
+                encounters = _get_encounters()
+                by_id = {e.encounter_id: e for e in encounters}
+                a, b = by_id.get(ids[0]), by_id.get(ids[1])
+                if a is None or b is None:
                     self.send_error(404, 'one or both encounters not found '
                                          '(ids may have shifted under new params)')
                     return
-                self._serve_json(payload)
+                self._serve_json(_diff_payload(a, b))
+            elif path == '/api/diff/cross':
+                # Cross-log diff. `primary_id` resolves against the
+                # active log's encounters, `secondary_id` against the
+                # comparison log's. Each log's basename is included on
+                # the encounter cards so the user can tell them apart.
+                if _State.comparison_logfile is None:
+                    # send_error puts the message in the HTTP status line
+                    # which is latin-1 only — keep it ASCII (no em-dash).
+                    self.send_error(400, 'no comparison log loaded; '
+                                         'POST /api/comparison/open or '
+                                         '/api/comparison/upload first')
+                    return
+                try:
+                    primary_id = int(qs.get('primary_id', [''])[0])
+                    secondary_id = int(qs.get('secondary_id', [''])[0])
+                except ValueError:
+                    self.send_error(400, 'primary_id and secondary_id '
+                                         'must be integers')
+                    return
+                primary = _get_encounters()
+                secondary = _get_comparison_encounters()
+                a = next((e for e in primary
+                          if e.encounter_id == primary_id), None)
+                b = next((e for e in secondary
+                          if e.encounter_id == secondary_id), None)
+                if a is None or b is None:
+                    self.send_error(404, 'one or both encounters not found '
+                                         '(ids may have shifted under new params)')
+                    return
+                self._serve_json(_diff_payload(
+                    a, b,
+                    log_a=os.path.basename(_State.logfile),
+                    log_b=os.path.basename(_State.comparison_logfile)))
+            elif path == '/api/comparison/session':
+                # Mirror of /api/session for the comparison log so the
+                # second-log encounter picker can render a session table
+                # before the user picks which encounter to diff against.
+                self._serve_json(self._comparison_session_payload())
             elif path == '/api/parse-status':
                 # Lock-free read of the progress dict — single attribute
                 # access, GIL-safe. Polled rapidly by the upload UI to
@@ -1198,6 +1374,25 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                 self._serve_json(self._session_payload())
                 return
 
+            # /api/comparison/upload mirrors /api/upload but routes the
+            # saved file to the comparison-log slots. Used by the
+            # drag-drop "Compare" path when a primary log is already
+            # loaded — the drop-side picker streams here instead of
+            # replacing the primary.
+            if path == '/api/comparison/upload':
+                raw_name = self.headers.get('X-Filename', 'uploaded.txt')
+                filename = urllib.parse.unquote(raw_name)
+                if length <= 0:
+                    self.send_error(400, 'empty upload')
+                    return
+                if _State.logfile is None:
+                    self.send_error(400, 'load a primary log first')
+                    return
+                saved = _save_uploaded_log(filename, length, self.rfile)
+                _set_comparison_logfile(saved)
+                self._serve_json(self._comparison_session_payload())
+                return
+
             body = self.rfile.read(length).decode('utf-8') if length else ''
             data = json.loads(body) if body else {}
 
@@ -1208,6 +1403,24 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                     return
                 _set_logfile(requested)
                 self._serve_json(self._session_payload())
+            elif path == '/api/comparison/open':
+                # Load a second log for cross-log diff. Body: {"path":...}.
+                # Requires a primary log already loaded — comparison
+                # without primary has no diff target.
+                if _State.logfile is None:
+                    self.send_error(400, 'load a primary log first')
+                    return
+                requested = data.get('path')
+                if not requested:
+                    self.send_error(400, 'missing "path" in body')
+                    return
+                _set_comparison_logfile(requested)
+                self._serve_json(self._comparison_session_payload())
+            elif path == '/api/comparison/clear':
+                # Drop the comparison log. No body needed. Idempotent.
+                with _State.fights_lock:
+                    _clear_comparison_locked()
+                self._serve_json({'ok': True})
             elif path == '/api/params':
                 # Update detection / grouping knobs and invalidate caches.
                 # Allowed without a log loaded so the picker can pre-set
@@ -1417,12 +1630,22 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                 'summary': None,
                 'pet_owners': {},
                 'manual_encounters': 0,
+                'comparison': None,
             }
         encounters = _get_encounters()
         # Pre-compute the manual-encounter keysets once so the per-row
         # `is_manual` flag is O(members) per row rather than O(members^2).
         sidecar = _State.sidecar or Sidecar.empty()
         manual_keysets = [set(m.fight_keys) for m in sidecar.manual_encounters]
+        # Compact comparison-log status for the session-view header /
+        # action bar: just enough for the front-end to render a
+        # "Comparison: <filename>" label and offer a Clear button. The
+        # full encounter list comes from /api/comparison/session.
+        comparison_meta = None
+        if _State.comparison_logfile is not None:
+            comparison_meta = {
+                'logfile_basename': os.path.basename(_State.comparison_logfile),
+            }
         return {
             'logfile': _State.logfile,
             'logfile_basename': os.path.basename(_State.logfile),
@@ -1436,6 +1659,34 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
             },
             'pet_owners': dict(sidecar.pet_owners),
             'manual_encounters': len(sidecar.manual_encounters),
+            'comparison': comparison_meta,
+        }
+
+    def _comparison_session_payload(self):
+        """Mirror of `_session_payload` for the comparison log. Same
+        encounter-row shape so the front-end can reuse the session-table
+        renderer for the second-log encounter picker, but no params /
+        sidecar fields (read-only from the diff path)."""
+        if _State.comparison_logfile is None:
+            return {
+                'logfile': None,
+                'logfile_basename': None,
+                'encounters': [],
+                'summary': None,
+            }
+        encounters = _get_comparison_encounters()
+        sidecar = _State.comparison_sidecar or Sidecar.empty()
+        manual_keysets = [set(m.fight_keys) for m in sidecar.manual_encounters]
+        return {
+            'logfile': _State.comparison_logfile,
+            'logfile_basename': os.path.basename(_State.comparison_logfile),
+            'encounters': [_encounter_summary(e, manual_keysets)
+                           for e in encounters],
+            'summary': {
+                'total_encounters': len(encounters),
+                'total_killed': sum(1 for e in encounters if e.fight_complete),
+                'total_damage': sum(e.total_damage for e in encounters),
+            },
         }
 
     def _fight_payload(self, fight_id: int):

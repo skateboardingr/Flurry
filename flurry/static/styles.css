@@ -427,6 +427,15 @@
                     margin-bottom: 4px; font-weight: 600; }
   .diff-enc-name { color: var(--text-bright); font-weight: 600;
                    font-size: 1rem; margin-bottom: 6px; }
+  /* Cross-log diff: filename row under the encounter name so the user
+     can tell which log each side came from at a glance. Truncates with
+     ellipsis on long paths; the full filename is on the title attr. */
+  .diff-enc-log { font-size: 0.78rem; color: var(--text-dim);
+                  margin: -2px 0 6px; white-space: nowrap;
+                  overflow: hidden; text-overflow: ellipsis;
+                  font-variant-numeric: tabular-nums; }
+  .diff-enc-log .sub { font-size: 0.7rem; margin-right: 4px;
+                       text-transform: uppercase; letter-spacing: 0.04em; }
   .diff-enc-meta { display: flex; gap: 12px; flex-wrap: wrap;
                    font-size: 0.85rem; color: var(--text-dim);
                    margin-bottom: 8px; }
@@ -512,6 +521,20 @@
   .diff-bar-delta .diff-bar-fill.better { background: var(--good); opacity: 0.7; }
   .diff-bar-delta .diff-bar-fill.worse  { background: var(--bad);  opacity: 0.7; }
   .diff-bar-delta .diff-bar-fill.flat   { background: var(--border); }
+
+  /* Cross-log compare picker: primary card + step-2 panel side by side
+     above the comparison-log session table. Stacks below 800px. */
+  .cross-compare-grid { display: grid; gap: 16px;
+                        grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+                        margin-bottom: 16px; }
+  @media (max-width: 800px) {
+    .cross-compare-grid { grid-template-columns: 1fr; }
+  }
+  .cross-step { color: var(--text-bright); font-size: 1rem;
+                margin: 0 0 8px; font-weight: 600; }
+  .cross-comp-meta { display: flex; flex-wrap: wrap; align-items: center;
+                     gap: 12px; font-size: 0.9rem; }
+  .cross-comp-meta strong { color: var(--text-bright); }
 
   .diff-hidden-strip { display: flex; flex-wrap: wrap; gap: 6px;
                        align-items: center; }

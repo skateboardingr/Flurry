@@ -638,42 +638,78 @@ pattern, think about ordering.
       stay damage-only. Delta mode in the modal hides the by-source
       breakdown and skips the click-to-window UX (no individual events).
 
-### Encounter diff (compare two encounters in the same log)
-- [x] `_diff_payload(encounters, [a_id, b_id])` returns a parallel
-      per-actor row payload over the union of attackers/defenders/
-      healers in both encounters. Side classification (`received >
-      dealt + healed`) is computed across the union so an actor stays
-      on the same side in both columns even if one encounter alone
-      would flip them. Per-actor `values[2]` carries 6 metrics each
-      side: `damage`/`dps`, `damage_taken`/`dtps`, `healing`/`hps`,
-      plus `biggest_*` and a `present` flag distinguishing "zero
-      activity" from "actor missing entirely from this encounter".
-- [x] `GET /api/diff?ids=A,B` — exactly 2 integer ids required (400
-      otherwise); 404 if either id can't be resolved (params shifted
-      since the user picked).
-- [x] `#/diff?ids=A,B` route opened from a **Compare** button in the
-      session-view header. The button is disabled-but-visible until
-      the user ticks exactly 2 encounters — discoverable from empty
-      state, with a title attribute that explains why it's disabled.
-- [x] View has three metric tabs (**Damage** / **Damage taken** /
-      **Healing**) and a display toggle (**Side-by-side** /
-      **Delta**). Side-by-side is two stacked bars per row sharing an
-      x-scale across all visible rows so absolute magnitudes read
-      true. Delta is one centered-on-zero bar per row, colored by
-      *meaning*: for damage and healing a positive delta is green
-      ("better"); for damage taken positive is red ("worse"). The
-      `betterIfHigher` flag on each `DIFF_MODES` entry is the only
-      place this semantic lives, so adding a future mode (e.g.
-      "deaths") just sets the flag.
+### Encounter diff (in-log + cross-log)
+- [x] `_diff_payload(enc_a, enc_b, log_a=None, log_b=None)` builds the
+      per-actor row payload from two resolved `Encounter` objects. The
+      union covers all attackers / defenders / healers across both;
+      side classification (`received > dealt + healed`) is computed
+      across the union so an actor stays on the same side even if one
+      encounter alone would flip them. Per-actor `values[2]` carries 6
+      metrics each side: `damage`/`dps`, `damage_taken`/`dtps`,
+      `healing`/`hps`, plus `biggest_*` and a `present` flag
+      distinguishing "zero activity" from "actor missing entirely from
+      this encounter". Optional `log_a`/`log_b` labels (filenames) tag
+      each encounter card so cross-log diffs are visually grounded in
+      which log each side came from. The payload includes
+      `cross_log: true|false` so the front-end knows which mode it's in.
+- [x] **In-log diff**: `GET /api/diff?ids=A,B` (exactly 2 integer ids
+      from the active log; 400 otherwise, 404 if either id can't be
+      resolved). Opened from `#/diff?ids=A,B`, reachable via the
+      **Compare** button in the action bar (enabled at N=2).
+- [x] **Cross-log diff**: `GET /api/diff/cross?primary_id=A&secondary_id=B`.
+      `primary_id` resolves against `_get_encounters()`; `secondary_id`
+      resolves against `_get_comparison_encounters()`. 400 when no
+      comparison log is loaded, 400 on non-int ids, 404 on unknown ids.
+      Opened from `#/diff/cross?primary=A&secondary=B`, reachable via
+      the **Compare across logs** button in the action bar (enabled at
+      N=1) → `#/cross-compare?primary=N` picker → click an encounter in
+      the comparison log's session table.
+- [x] Diff view (`renderDiff`) takes a `spec` object: `{mode: 'same',
+      ids: [a, b]}` or `{mode: 'cross', primaryId, secondaryId}`. Same
+      render path for both — encounter cards in cross-log mode get a
+      **log: filename** subtitle right under the encounter name. Three
+      metric tabs (**Damage** / **Damage taken** / **Healing**) and a
+      display toggle (**Side-by-side** / **Delta**). Side-by-side is
+      two stacked bars per row sharing an x-scale across all visible
+      rows. Delta is one centered-on-zero bar per row, colored by
+      *meaning*: for damage and healing a positive delta is green; for
+      damage taken positive is red. The `betterIfHigher` flag on each
+      `DIFF_MODES` entry is the only place this semantic lives, so
+      adding a future mode (e.g. "deaths") just sets the flag.
 - [x] Per-actor checkboxes hide rows the user doesn't care about
       (e.g. trial-running pets that fired only once); a hidden-row
       strip at the bottom of the page lists what's hidden with
       one-click un-hide buttons. State is module-scope so flipping
       tabs preserves both the hide-set and the chosen display mode.
-- [x] **Same-log only.** Cross-log diffing (the actually-useful
-      "before/after gear change across raid nights" case) needs the
-      server to track multiple loaded logs simultaneously plus a UI
-      to pick the second log; explicitly punted to the next pass.
+- [x] **Comparison-log state** lives in parallel `_State.comparison_*`
+      slots (`comparison_logfile`, `comparison_fights`, `comparison_heals`,
+      `comparison_encounters`, `comparison_sidecar`) mirroring the
+      primary lifecycle but never feeding into the editing flows
+      (sidecar mutation, manual encounter merges all stay primary-only).
+      Detection params come from the same `_State` fields the primary
+      uses so encounters detected in both logs are directly comparable.
+      `_set_logfile` (primary swap) calls `_clear_comparison_locked()`
+      so a stale "compare against this other log" doesn't survive
+      changing the primary.
+- [x] **Comparison endpoints**: `POST /api/comparison/open` (load by
+      path), `POST /api/comparison/upload` (drag-drop streaming, mirrors
+      `/api/upload`), `POST /api/comparison/clear` (drop the comparison;
+      idempotent), `GET /api/comparison/session` (encounter list, same
+      shape as `/api/session` minus editing fields).
+- [x] **Cross-compare picker view** (`renderCrossCompare`,
+      `#/cross-compare?primary=<id>`) shows the primary encounter card
+      at the top, then either a load-a-log panel (Browse… / paste
+      path / drag-drop) or — once a comparison is loaded — that log's
+      session table for picking the secondary encounter. Drag-drop on
+      this view is auto-routed to `/api/comparison/upload` instead of
+      replacing the primary, via the `_crossCompareDropTarget` flag
+      that the global drop handler reads. The flag resets in `route()`
+      on every navigation so it can't leak into other views.
+- [x] **Out of scope for v0.5.0**: cross-log encounter pairing UX
+      ("this looks like the same boss"), standalone "Replace or
+      Compare?" prompt for drops outside the cross-compare view (drops
+      elsewhere still replace primary), and N>2 logs (the parallel-
+      state approach caps at exactly two loaded logs by design).
 
 ### Sidecar / user overrides (`flurry/sidecar.py`)
 - [x] `<logfile>.flurry.json` next to each log holds two kinds of edits:
@@ -820,7 +856,10 @@ should look like:
 - **Hash-routed SPA, plain vanilla JS.** No framework. Views switched
   by `location.hash`: `#/` (session list), `#/picker` (file picker),
   `#/encounter/<id>` (encounter detail), `#/session-summary` (multi-fight
-  rollup), `#/diff` (two-encounter compare), `#/debug` (parser coverage).
+  rollup), `#/diff` (in-log two-encounter compare),
+  `#/cross-compare?primary=<id>` (comparison-log picker for cross-log
+  diff), `#/diff/cross?primary=A&secondary=B` (cross-log diff view),
+  `#/debug` (parser coverage).
   The front-end lives as files under `flurry/static/` (`index.html`,
   `styles.css`, `app.js`) and is served by a `/static/<name>` route via
   `importlib.resources.files('flurry') / 'static'`. The same path

@@ -512,14 +512,21 @@ async function renderSession() {
     const n = sessionSelected.size;
     if (n === 0) return '';
     const mergeDisabled = n < 2 ? ' disabled' : '';
-    // Compare requires exactly N=2 (the diff endpoint is strictly
-    // two-encounter). Render it disabled-but-visible at other counts so
-    // users see what's available when they have a row ticked, with the
-    // title attribute explaining why it isn't clickable yet.
+    // Compare requires exactly N=2 (in-log diff is strictly two
+    // encounters). Compare-across-logs requires exactly N=1 (one
+    // primary encounter pairs with one comparison-log encounter
+    // selected later). Both render disabled-but-visible at other
+    // counts so users see what's available — the title attributes
+    // explain why each isn't clickable yet.
     const compareDisabled = n !== 2 ? ' disabled' : '';
     const compareTitle = n === 2
       ? 'Compare these two encounters side-by-side (DPS, damage taken, healing).'
       : `Tick exactly 2 encounters to compare them (currently ${n}).`;
+    const crossDisabled = n !== 1 ? ' disabled' : '';
+    const crossTitle = n === 1
+      ? 'Compare this encounter against one from a different log file. ' +
+        'Useful for before/after gear comparisons across raid nights.'
+      : `Tick exactly 1 encounter to compare it against another log (currently ${n}).`;
     return `
       <div class="action-bar" id="action-bar">
         <span class="count">${n} selected</span>
@@ -529,6 +536,8 @@ async function renderSession() {
                 title="Remove these encounters from any manual groupings, returning them to auto-grouped state.">Split</button>
         <button class="btn ${n === 2 ? 'primary' : ''}" id="act-compare"${compareDisabled}
                 title="${compareTitle}">Compare</button>
+        <button class="btn ${n === 1 ? 'primary' : ''}" id="act-compare-cross"${crossDisabled}
+                title="${crossTitle}">Compare across logs</button>
         <button class="btn" id="act-clear"
                 title="Clear the selection.">Clear</button>
       </div>`;
@@ -687,6 +696,7 @@ async function renderSession() {
     const merge = document.getElementById('act-merge');
     const split = document.getElementById('act-split');
     const compare = document.getElementById('act-compare');
+    const crossCompare = document.getElementById('act-compare-cross');
     const clear = document.getElementById('act-clear');
     if (clear) clear.addEventListener('click', () => {
       sessionSelected.clear();
@@ -700,6 +710,14 @@ async function renderSession() {
       if (sessionSelected.size !== 2) return;
       const ids = Array.from(sessionSelected).join(',');
       location.hash = `#/diff?ids=${ids}`;
+    });
+    if (crossCompare) crossCompare.addEventListener('click', () => {
+      if (sessionSelected.size !== 1) return;
+      const primaryId = Array.from(sessionSelected)[0];
+      // Send the user to the comparison-log picker. The picker reads
+      // primary= off the hash and carries it forward through the second
+      // log's encounter selection to the final cross-log diff route.
+      location.hash = `#/cross-compare?primary=${primaryId}`;
     });
   }
 
@@ -1967,23 +1985,45 @@ function fmtPct(pct) {
   return `${sign}${Math.abs(pct).toFixed(1)}%`;
 }
 
-async function renderDiff(ids) {
+async function renderDiff(spec) {
   if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
   const app = document.getElementById('app');
 
-  if (!ids || ids.length !== 2) {
+  // `spec` is one of:
+  //   {mode: 'same',  ids: [a, b]}             → /api/diff?ids=A,B
+  //   {mode: 'cross', primaryId, secondaryId}  → /api/diff/cross?...
+  //   null / malformed                         → friendly fallback
+  // Same-log diff was the v0.4.0 entry point; cross-log piggy-backs on
+  // the same render path because the payload shape is identical (both
+  // return `encounters[2]` + `actors[]`, with `cross_log: true/false`
+  // and an optional `log` field on each encounter for the cross case).
+  let url, ok = false;
+  if (spec && spec.mode === 'same' && Array.isArray(spec.ids) &&
+      spec.ids.length === 2) {
+    url = `/api/diff?ids=${spec.ids.join(',')}`;
+    ok = true;
+  } else if (spec && spec.mode === 'cross' &&
+             Number.isFinite(spec.primaryId) &&
+             Number.isFinite(spec.secondaryId)) {
+    url = `/api/diff/cross?primary_id=${spec.primaryId}` +
+          `&secondary_id=${spec.secondaryId}`;
+    ok = true;
+  }
+  if (!ok) {
     setHeader('Compare encounters', '', true);
     app.innerHTML = `<a href="#/" class="back">← back</a>` +
-      `<div class="panel sub">Compare needs exactly two encounter ids in the URL ` +
-      `(e.g. <code>#/diff?ids=71,72</code>). Tick two rows in the session table ` +
-      `and click <strong>Compare</strong>.</div>`;
+      `<div class="panel sub">Compare needs encounter ids in the URL — ` +
+      `<code>#/diff?ids=A,B</code> for in-log, ` +
+      `<code>#/diff/cross?primary=A&amp;secondary=B</code> for cross-log. ` +
+      `Tick rows in the session table and click <strong>Compare</strong> ` +
+      `or <strong>Compare across logs</strong>.</div>`;
     return;
   }
 
   let data;
   try {
     data = await withParseProgress(
-      () => fetchJSON(`/api/diff?ids=${ids.join(',')}`), app, 'Parsing log…');
+      () => fetchJSON(url), app, 'Parsing log…');
   } catch (e) {
     app.innerHTML = `<a href="#/" class="back">← back</a>` +
       `<div class="err">Failed to load diff: ${escapeHTML(e.message)}. ` +
@@ -2013,10 +2053,20 @@ async function renderDiff(ids) {
 
   function encCard(e, label, accentClass) {
     const status = e.fight_complete ? 'KILLED' : 'incomplete';
+    // Cross-log: the payload tags each encounter with its source log
+    // basename so the card reads "log: eqlog_X.txt" right under the
+    // encounter name. Same-log entries leave `log` null and the row
+    // just doesn't render.
+    const logRow = e.log
+      ? `<div class="diff-enc-log" title="${escapeHTML(e.log)}">
+           <span class="sub">log</span> ${escapeHTML(e.log)}
+         </div>`
+      : '';
     return `
       <div class="diff-enc-card ${accentClass}">
         <div class="diff-enc-label">${label}</div>
         <div class="diff-enc-name">#${e.encounter_id} ${escapeHTML(e.name)}</div>
+        ${logRow}
         <div class="diff-enc-meta">
           <span>${escapeHTML(e.start || '—')}</span>
           <span>${FMT_DUR(e.duration_seconds)}</span>
@@ -2245,7 +2295,7 @@ async function renderDiff(ids) {
       const m = btn.dataset.diffMode;
       if (m === diffSettings.mode) return;
       diffSettings.mode = m;
-      renderDiff(ids);
+      renderDiff(spec);
     });
   });
 
@@ -2254,7 +2304,7 @@ async function renderDiff(ids) {
       const d = btn.dataset.diffDisplay;
       if (d === diffSettings.display) return;
       diffSettings.display = d;
-      renderDiff(ids);
+      renderDiff(spec);
     });
   });
 
@@ -2262,7 +2312,7 @@ async function renderDiff(ids) {
   if (enemiesEl) {
     enemiesEl.addEventListener('change', e => {
       diffSettings.showEnemies = e.target.checked;
-      renderDiff(ids);
+      renderDiff(spec);
     });
   }
 
@@ -2271,7 +2321,7 @@ async function renderDiff(ids) {
       const actor = e.target.dataset.actor;
       if (e.target.checked) diffSettings.hidden.delete(actor);
       else diffSettings.hidden.add(actor);
-      renderDiff(ids);
+      renderDiff(spec);
     });
   });
 
@@ -2285,14 +2335,14 @@ async function renderDiff(ids) {
       } else {
         for (const a of shown) diffSettings.hidden.add(a.name.toLowerCase());
       }
-      renderDiff(ids);
+      renderDiff(spec);
     });
   }
 
   app.querySelectorAll('.diff-unhide').forEach(btn => {
     btn.addEventListener('click', () => {
       diffSettings.hidden.delete(btn.dataset.actor);
-      renderDiff(ids);
+      renderDiff(spec);
     });
   });
 
@@ -2300,8 +2350,322 @@ async function renderDiff(ids) {
   if (unhideAllBtn) {
     unhideAllBtn.addEventListener('click', () => {
       diffSettings.hidden.clear();
-      renderDiff(ids);
+      renderDiff(spec);
     });
+  }
+}
+
+// --- Cross-log compare picker ----------------------------------------
+//
+// Two-step flow: user ticks 1 encounter in the primary session list and
+// clicks **Compare across logs**, landing on `#/cross-compare?primary=N`.
+// This view either offers a way to load a second log (file picker /
+// drag-drop) or, if a comparison is already loaded, shows that log's
+// session table so the user can pick which secondary encounter to diff
+// against. Clicking a row navigates to `#/diff/cross?primary=A&secondary=B`
+// and the existing renderDiff path takes over.
+//
+// State: the comparison log's parse lives on the server (_State.comparison_*),
+// so this view is mostly a thin renderer over /api/comparison/session.
+
+async function renderCrossCompare(primaryId) {
+  if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+  const app = document.getElementById('app');
+  app.innerHTML = '<div class="sub">Loading…</div>';
+
+  if (!Number.isFinite(primaryId)) {
+    setHeader('Compare across logs', '', true);
+    app.innerHTML = `<a href="#/" class="back">← back</a>` +
+      `<div class="panel sub">Pick a primary encounter first — tick exactly 1 row ` +
+      `in the session table and click <strong>Compare across logs</strong>.</div>`;
+    return;
+  }
+
+  // Pull primary session + comparison status in parallel so we can
+  // render the right state (no comparison vs comparison loaded) on
+  // first paint without sequential round-trips.
+  let primarySession, comparisonSession;
+  try {
+    [primarySession, comparisonSession] = await Promise.all([
+      fetchJSON('/api/session'),
+      fetchJSON('/api/comparison/session'),
+    ]);
+  } catch (e) {
+    app.innerHTML = `<a href="#/" class="back">← back</a>` +
+      `<div class="err">Failed to load: ${escapeHTML(e.message)}</div>`;
+    return;
+  }
+
+  if (primarySession.logfile === null) {
+    setHeader('Compare across logs', '', false);
+    app.innerHTML = `<a href="#/" class="back">← back</a>` +
+      `<div class="panel sub">No primary log loaded. Open one first, then ` +
+      `come back to compare it against another.</div>`;
+    return;
+  }
+
+  const primary = (primarySession.encounters || [])
+    .find(e => e.encounter_id === primaryId);
+  if (!primary) {
+    setHeader('Compare across logs', '', true);
+    app.innerHTML = `<a href="#/" class="back">← back</a>` +
+      `<div class="panel sub">Couldn't find encounter #${primaryId} in the primary log — ` +
+      `the detection params may have changed and ids shifted. ` +
+      `<a href="#/">Go back</a> and reselect.</div>`;
+    return;
+  }
+
+  setHeader('Compare across logs',
+            `Primary: #${primary.encounter_id} ${primary.name}`,
+            true);
+
+  // Toggle drag-drop routing: while this view is mounted, drops should
+  // load the second log (comparison), not replace the primary. The flag
+  // is checked by the global drop handler. Cleared on navigation away
+  // (the next route() call inside the drop handler picks the correct
+  // route for whatever view we land on).
+  _crossCompareDropTarget = true;
+
+  const primaryCard = `
+    <div class="panel diff-enc-card a"
+         style="margin: 0; border-left-width: 3px;">
+      <div class="diff-enc-label">Primary encounter</div>
+      <div class="diff-enc-name">#${primary.encounter_id} ${escapeHTML(primary.name)}</div>
+      <div class="diff-enc-log" title="${escapeHTML(primarySession.logfile_basename)}">
+        <span class="sub">log</span> ${escapeHTML(primarySession.logfile_basename)}
+      </div>
+      <div class="diff-enc-meta">
+        <span>${escapeHTML(primary.start || '—')}</span>
+        <span>${FMT_DUR(primary.duration_seconds)}</span>
+        <span class="${primary.fight_complete ? 'ok' : 'warn'}">${primary.fight_complete ? 'KILLED' : 'incomplete'}</span>
+      </div>
+      <div class="diff-enc-stats">
+        <div><span class="sub">Damage</span> ${NUM(primary.total_damage)}</div>
+        <div><span class="sub">Raid DPS</span> ${NUM(primary.raid_dps)}</div>
+      </div>
+    </div>`;
+
+  const hasComparison = comparisonSession.logfile !== null;
+
+  if (!hasComparison) {
+    // Step 1: no comparison loaded yet. Show a load-a-log panel —
+    // browse, paste a path, OS file picker, or drag-drop anywhere on
+    // the page. Same affordances as the main picker, just routed to
+    // /api/comparison/* endpoints.
+    app.innerHTML = `
+      <a href="#/" class="back">← back</a>
+      <div class="cross-compare-grid">
+        ${primaryCard}
+        <div class="panel">
+          <h3 class="cross-step">Step 2 — load a comparison log</h3>
+          <p class="sub" style="margin-top:0">
+            Pick a second log to compare this encounter against. Drag-drop
+            the file anywhere on the page, click <strong>Browse…</strong>,
+            or paste a full path below.
+          </p>
+          <div class="picker-input-row">
+            <input id="cc-path-input" placeholder="Paste a full path…">
+            <button class="btn primary" id="cc-open-btn">Open</button>
+            <button class="btn" id="cc-browse-btn"
+                    title="Pick a log file via the OS file dialog.">Browse…</button>
+            <input type="file" id="cc-file-input" accept=".txt,.log,.*"
+                   style="display:none">
+          </div>
+        </div>
+      </div>`;
+
+    document.getElementById('cc-open-btn').addEventListener('click',
+      () => openComparisonByPath(document.getElementById('cc-path-input').value, primaryId));
+    document.getElementById('cc-path-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter')
+        openComparisonByPath(e.target.value, primaryId);
+    });
+    document.getElementById('cc-browse-btn').addEventListener('click',
+      () => document.getElementById('cc-file-input').click());
+    document.getElementById('cc-file-input').addEventListener('change', e => {
+      if (e.target.files.length > 0)
+        uploadComparisonLog(e.target.files[0], primaryId);
+    });
+    return;
+  }
+
+  // Step 2: comparison is loaded. Show its session table — click any
+  // row to navigate to the cross-log diff. A "Pick a different log"
+  // button clears the comparison and bounces back to step 1.
+  const rows = (comparisonSession.encounters || []).map(e => `
+    <tr class="fight-row" data-secondary="${e.encounter_id}">
+      <td class="num">${e.encounter_id}</td>
+      <td>${escapeHTML(e.start || '—')}</td>
+      <td class="num">${FMT_DUR(e.duration_seconds)}</td>
+      <td class="target">${escapeHTML(e.name)}</td>
+      <td class="num">${NUM(e.total_damage)}</td>
+      <td class="num">${NUM(e.raid_dps)}</td>
+      <td class="status ${e.fight_complete ? 'killed' : 'incomplete'}">
+        ${e.fight_complete ? 'Killed' : 'Incomplete'}</td>
+    </tr>`).join('');
+
+  const empty = (comparisonSession.encounters || []).length === 0
+    ? `<div class="panel sub">No encounters detected in this log under the
+       current params. Adjust min damage / since-hours and reload.</div>`
+    : '';
+
+  app.innerHTML = `
+    <a href="#/" class="back">← back</a>
+    <div class="cross-compare-grid">
+      ${primaryCard}
+      <div class="panel">
+        <h3 class="cross-step">Step 2 — pick the comparison encounter</h3>
+        <div class="cross-comp-meta">
+          <span>Comparison log: <strong>${escapeHTML(comparisonSession.logfile_basename)}</strong></span>
+          <span class="sub">${comparisonSession.summary.total_encounters} encounters,
+            ${comparisonSession.summary.total_killed} killed</span>
+          <button class="btn" id="cc-clear-btn"
+                  title="Drop this comparison log and pick a different one.">Pick a different log</button>
+        </div>
+      </div>
+    </div>
+    ${empty}
+    ${rows ? `
+      <div class="panel">
+        <table>
+          <thead><tr>
+            <th class="num">#</th><th>Start</th><th class="num">Dur</th>
+            <th>Target</th><th class="num">Damage</th><th class="num">Raid DPS</th>
+            <th>Status</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>` : ''}`;
+
+  app.querySelectorAll('tr.fight-row[data-secondary]').forEach(tr => {
+    tr.addEventListener('click', () => {
+      const secondaryId = tr.dataset.secondary;
+      location.hash = `#/diff/cross?primary=${primaryId}&secondary=${secondaryId}`;
+    });
+  });
+
+  document.getElementById('cc-clear-btn').addEventListener('click', async () => {
+    try {
+      await fetch('/api/comparison/clear', { method: 'POST' });
+      renderCrossCompare(primaryId);
+    } catch (e) {
+      // Non-fatal — leave the user where they are; they can hit Back.
+    }
+  });
+}
+
+// While renderCrossCompare is mounted, drag-dropped files load as the
+// comparison log instead of replacing the primary. The global drop
+// handler reads this flag and routes accordingly.
+let _crossCompareDropTarget = false;
+
+async function openComparisonByPath(path, primaryId) {
+  if (!path || !path.trim()) return;
+  const app = document.getElementById('app');
+  app.innerHTML = `<div class="sub">Loading comparison log…</div>` +
+                  parseProgressHTML(null, 'Parsing comparison log…');
+  const stop = startParsePoll(s => {
+    if (s.state === 'parsing') {
+      app.innerHTML = parseProgressHTML(s, 'Parsing comparison log…');
+    }
+  });
+  try {
+    const r = await fetch('/api/comparison/open', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path: path.trim()}),
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      throw new Error(txt || `HTTP ${r.status}`);
+    }
+  } catch (e) {
+    if (stop) stop();
+    app.innerHTML = `<div class="err">Failed to open: ${escapeHTML(e.message)}</div>` +
+                    `<button class="btn" onclick="renderCrossCompare(${primaryId})">Back</button>`;
+    return;
+  }
+  if (stop) stop();
+  renderCrossCompare(primaryId);
+}
+
+async function uploadComparisonLog(file, primaryId) {
+  // Mirror of uploadLog but POSTs to /api/comparison/upload. Reuses the
+  // same upload UI affordances (progress bar, parse-status flip).
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div class="upload-status">
+      <div class="upload-label">Uploading comparison <strong>${escapeHTML(file.name)}</strong> (${fmtSize(file.size)})</div>
+      <div class="progress-track"><div class="progress-fill" id="upload-bar" style="width:0%"></div></div>
+      <div class="upload-pct sub" id="upload-pct">0%</div>
+    </div>`;
+
+  const setPct = txt => {
+    const el = document.getElementById('upload-pct');
+    if (el) el.textContent = txt;
+  };
+  const setBar = pct => {
+    const el = document.getElementById('upload-bar');
+    if (el) el.style.width = pct + '%';
+  };
+  let stopPoll = null;
+  let phase = 'upload';
+  const setLabel = txt => {
+    const el = document.querySelector('#app .upload-label');
+    if (el) el.innerHTML = txt;
+  };
+  const flipToParsing = () => {
+    if (phase !== 'upload') return;
+    phase = 'parse';
+    setBar(0);
+    setPct('Parsing comparison log…');
+    setLabel(`Parsing comparison <strong>${escapeHTML(file.name)}</strong>`);
+  };
+
+  try {
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/comparison/upload');
+      xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.upload.addEventListener('progress', e => {
+        if (phase !== 'upload' || !e.lengthComputable) return;
+        const pct = Math.round(e.loaded / e.total * 100);
+        setBar(pct);
+        setPct(pct + '%');
+      });
+      xhr.upload.addEventListener('load', flipToParsing);
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300) resolve();
+        else reject(new Error(xhr.responseText || `HTTP ${xhr.status}`));
+      });
+      xhr.addEventListener('error', () => reject(new Error('Network error during upload')));
+      xhr.addEventListener('abort', () => reject(new Error('Upload aborted')));
+      xhr.send(file);
+      stopPoll = startParsePoll(s => {
+        if (s.state === 'parsing') {
+          flipToParsing();
+          if (phase === 'parse') {
+            setBar(s.pct);
+            const note = (s.total_bytes > 0)
+              ? `${fmtMB(s.bytes_read)} / ${fmtMB(s.total_bytes)} · ${s.pct.toFixed(1)}%`
+              : `${s.pct.toFixed(1)}%`;
+            setPct(note);
+          }
+        } else if (s.state === 'done' && phase === 'parse') {
+          setBar(100);
+          setPct('Finalizing…');
+        } else if (s.state === 'error') {
+          setPct('Parse error');
+        }
+      });
+    });
+    if (stopPoll) { stopPoll(); stopPoll = null; }
+    renderCrossCompare(primaryId);
+  } catch (e) {
+    if (stopPoll) { stopPoll(); stopPoll = null; }
+    app.innerHTML = `<div class="err">Comparison upload failed: ${escapeHTML(e.message)}</div>` +
+                    `<button class="btn" onclick="renderCrossCompare(${primaryId})">Back</button>`;
   }
 }
 
@@ -3155,18 +3519,23 @@ function showHitsForRange(hits, startIdx, endIdx, bucketSeconds, amountLabel) {
 
 function route() {
   const hash = location.hash;
+  // Reset cross-compare drop routing on every nav. renderCrossCompare
+  // re-sets the flag if we're landing on its view; any other route
+  // leaves it false so drops behave normally.
+  _crossCompareDropTarget = false;
   // Session-locked layout: only the encounter table scrolls; everything
   // above it (header, summary, params, action bar) stays pinned. Apply
   // the body class only on the session list view — every other view
-  // (encounter detail, summary, diff, debug, picker) uses normal page
-  // scroll. Toggling here, before dispatch, keeps the lock state in one
-  // place rather than scattered across each renderer.
+  // (encounter detail, summary, diff, cross-compare, debug, picker)
+  // uses normal page scroll. Toggling here, before dispatch, keeps the
+  // lock state in one place rather than scattered across each renderer.
   const isSession = !hash || hash === '#' || hash === '#/' ||
                     (!hash.startsWith('#/encounter/') &&
                      !hash.startsWith('#/picker') &&
                      !hash.startsWith('#/debug') &&
                      !hash.startsWith('#/session-summary') &&
-                     !hash.startsWith('#/diff'));
+                     !hash.startsWith('#/diff') &&
+                     !hash.startsWith('#/cross-compare'));
   document.body.classList.toggle('session-locked', isSession);
 
   const encMatch = hash.match(/^#\/encounter\/(\d+)/);
@@ -3189,8 +3558,20 @@ function route() {
       if (ids.length === 0) ids = null;
     }
     renderSessionSummary(ids);
+  } else if (hash.startsWith('#/diff/cross')) {
+    // Cross-log diff: ?primary=A&secondary=B (one id per loaded log).
+    // Must come BEFORE the same-log #/diff prefix check.
+    const primary = (hash.match(/[?&]primary=(\d+)/) || [])[1];
+    const secondary = (hash.match(/[?&]secondary=(\d+)/) || [])[1];
+    if (primary && secondary) {
+      renderDiff({mode: 'cross',
+                  primaryId: parseInt(primary, 10),
+                  secondaryId: parseInt(secondary, 10)});
+    } else {
+      renderDiff(null);
+    }
   } else if (hash.startsWith('#/diff')) {
-    // Two-encounter side-by-side diff. `?ids=A,B` is required.
+    // Same-log two-encounter diff: ?ids=A,B (exactly 2).
     const idsMatch = hash.match(/[?&]ids=([0-9,]+)/);
     let ids = null;
     if (idsMatch) {
@@ -3198,7 +3579,13 @@ function route() {
         .map(s => parseInt(s, 10))
         .filter(n => Number.isFinite(n));
     }
-    renderDiff(ids);
+    renderDiff(ids ? {mode: 'same', ids: ids} : null);
+  } else if (hash.startsWith('#/cross-compare')) {
+    // Comparison-log picker. ?primary=<id> carries the already-selected
+    // primary encounter id forward through the second-log encounter
+    // pick to the final cross-log diff route.
+    const m = hash.match(/[?&]primary=(\d+)/);
+    renderCrossCompare(m ? parseInt(m[1], 10) : null);
   } else {
     renderSession();
   }
@@ -3261,7 +3648,21 @@ window.addEventListener('drop', async e => {
   e.preventDefault();
   _dragCounter = 0;
   _hideDropOverlay();
-  await uploadLog(e.dataTransfer.files[0]);
+  const file = e.dataTransfer.files[0];
+  // While the user is on the cross-compare picker view, route drops to
+  // /api/comparison/upload so dropping a file loads it as the second
+  // log instead of replacing the primary. Other views (session list,
+  // picker, encounter detail, etc.) keep the existing replace-primary
+  // semantics.
+  if (_crossCompareDropTarget) {
+    const m = location.hash.match(/[?&]primary=(\d+)/);
+    const primaryId = m ? parseInt(m[1], 10) : null;
+    if (Number.isFinite(primaryId)) {
+      await uploadComparisonLog(file, primaryId);
+      return;
+    }
+  }
+  await uploadLog(file);
 });
 
 async function uploadLog(file) {

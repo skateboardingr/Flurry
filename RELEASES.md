@@ -1,5 +1,88 @@
 # Releases
 
+## v0.5.0 — Cross-log encounter diff
+
+The diff view from v0.4.0 grows up: instead of comparing two encounters
+inside a single log, you can now load a **second log** alongside the
+primary and diff one encounter from each. Built for the actually-useful
+"before/after gear change between raid nights" case — different log
+files, same boss, side-by-side numbers.
+
+### Compare across logs
+
+Tick exactly **one** row in the session list and the action bar gains
+a **Compare across logs** button (next to the existing in-log Compare,
+which still requires N=2). Click it to land on the new comparison-log
+picker at `#/cross-compare?primary=<id>`:
+
+- **Primary encounter card** at the top of the page so you remember
+  which one you're comparing against (name, log filename, killed/
+  incomplete status, raid DPS).
+- **Load a comparison log** below: drag-drop the second log file
+  anywhere on the page, click **Browse…** for the OS file picker, or
+  paste a full path. Drag-drop on this view is auto-routed to the
+  comparison endpoint instead of replacing the primary.
+- Once parsed, the page flips to **Step 2 — pick the comparison
+  encounter** and shows that log's session table. Click any row to
+  open the cross-log diff.
+- A **Pick a different log** button drops the comparison and bounces
+  you back to the load-a-log step.
+
+### Cross-log diff view
+
+The existing `renderDiff()` view is reused — the payload shape is the
+same as in-log diff, with a `cross_log: true` flag and a `log` field on
+each encounter card. Cards in cross-log mode now show a **log:
+filename.txt** subtitle right under the encounter name so it's
+immediately obvious which log each side came from. Side classification
+(friendly / enemy) is still computed across the union, so an actor on
+both raid nights stays on the same side in both columns.
+
+### Server: parallel comparison-log state
+
+`_State` grows a parallel set of `comparison_*` slots — `comparison_logfile`,
+`comparison_fights`, `comparison_heals`, `comparison_encounters`,
+`comparison_sidecar` — that mirror the primary lifecycle but never feed
+into the editing flows (sidecar mutations, manual encounter merges, etc.
+all stay primary-only). The comparison parses with the **same
+detection params** as the primary so encounters detected in both logs
+are directly comparable. Swapping the primary log automatically clears
+the comparison — a stale "compare against this other log" loses
+meaning when the primary changes.
+
+New endpoints:
+
+- `POST /api/comparison/open` — load a second log from a disk path.
+- `POST /api/comparison/upload` — drag-drop the second log; mirrors
+  `/api/upload` shape.
+- `POST /api/comparison/clear` — drop the comparison.
+- `GET /api/comparison/session` — encounter list of the comparison
+  log (same shape as `/api/session`, sans editing fields).
+- `GET /api/diff/cross?primary_id=A&secondary_id=B` — the cross-log
+  diff payload.
+
+`_diff_payload` was refactored to take resolved `Encounter` objects
+plus optional log labels rather than encounter id lists, so both
+same-log and cross-log paths share one builder. Same-log callers
+leave the labels as `None` and the `log` field on each encounter card
+stays absent.
+
+### Cross-log only (for now)
+
+Out of scope for v0.5.0:
+
+- **Cross-log encounter pairing UX** ("this looks like the same boss" —
+  auto-suggesting which secondary encounter to compare against).
+- **Standalone "Replace or Compare?" prompt** when a primary is loaded
+  and the user drag-drops a file *outside* the cross-compare view.
+  Currently those drops still replace the primary, matching v0.4.0
+  behavior. The cross-compare view itself routes drops correctly.
+- **N>2 logs** — the parallel-state approach intentionally caps at
+  exactly two loaded logs. A future refactor to a `dict[path, Parsed]`
+  could lift the cap if a use case for it shows up.
+
+---
+
 ## v0.4.0 — Encounter diff + front-end split
 
 The headline addition is **encounter diffing** — pick two encounters
