@@ -188,6 +188,33 @@ button on encounter detail lets you assign owners to actors that don't
 carry the backtick-pet suffix in the log (mage water pets, charmed mobs);
 assignments persist to a `<logfile>.flurry.json` sidecar next to the log.
 
+### Live mode + player overlay
+
+When a log loads, **live mode** is on by default — a background follower
+thread tails the file every 250ms, parses appended events, and feeds
+them into the same detector the static parse populates. The session
+view, encounter detail, and debug counters all keep showing the latest
+state without needing a manual refresh after each fight. The header has
+a small ● indicator: green-pulsing while events are landing, yellow if
+the follower is alive but the log is quiet, dim grey if live mode is
+off or no log is loaded.
+
+A **Pop out overlay** button opens a compact, always-on-top window for
+the active character with four big counters (damage out, damage in,
+healing out, healing in) and an HP-Δ bar (red when net damage > heals,
+green when heals > damage). Between fights it falls back to a recap of
+the last encounter — top damage rows plus **Copy parse** / **Copy
+short** buttons that put a single-line, EQ-chat-friendly damage parse
+on your clipboard. A "combine pets" toggle rolls your pet rows into
+your row before formatting so the clipboard reads "you did N total."
+
+A **Pin overlay** button applies always-on-top + click-through via
+Win32 so the overlay sits over EQ as a HUD without intercepting your
+clicks. The click-through bit auto-toggles based on what the overlay
+is showing: HUD mode during an active fight (mouse passes through to
+EQ), interactive during the recap (so you can click Copy buttons).
+**Unpin overlay** reverts.
+
 Useful flags:
 
 - `--port N`: pick a different port (default 8765)
@@ -327,7 +354,10 @@ flurry/
 │   ├── server.py             # local web UI (stdlib http.server + JSON API)
 │   ├── static/               # front-end assets served via /static/<name>
 │   │   ├── styles.css
-│   │   └── app.js
+│   │   ├── app.js
+│   │   ├── overlay.html      # player overlay window
+│   │   ├── overlay.css
+│   │   └── overlay.js
 │   └── cli.py                # argparse entry functions
 ├── flurry.bat                # Windows launcher (wraps `python -m flurry`)
 ├── flurry.sh                 # POSIX launcher
@@ -363,21 +393,19 @@ What's left, in rough order of usefulness:
 
 - **JSON export** — `--json` flags on the CLI tools for piping into
   other tools. The UI already has its own JSON via `/api/*`.
-- **Live tail mode** — watch DPS / HPS / DTPS update in real time as
-  the log grows. `tail.py` already supports follow-mode; the analyzer
-  and server don't yet.
-  - **Player overlay** — a compact, always-on-top window with four
-    counters for the active character (damage out, damage in, healing
-    out, healing in) so you can glance at your own performance mid-fight
-    without alt-tabbing to the full UI.
-  - **HP delta indicator** — net HP change over the last second
-    (damage taken + heals received), green for gains and red for losses,
-    so you can see trouble coming before the health bar does.
+- **Configurable overlay layout** — counter sizes and panel
+  arrangement are hardcoded today; let users tune them.
+- **HP-Δ history chart** in the overlay — only the current rate is
+  shown, not a trace over the last few seconds.
+- **Multi-character overlay** — the overlay follows whichever log the
+  main UI has loaded. One-window-per-follower would let you watch
+  multi-boxed alts at once.
 
 Things that used to be on this list and have shipped — encounter
-grouping, pet ownership, session-summary rollups, healing tab, tanking
-tab with avoidance breakdown, life-delta toggle, in-log encounter
-diff, cross-log encounter diff. See `RELEASES.md` for the running
+grouping, pet ownership, session-summary rollups, healing tab,
+tanking tab with avoidance breakdown, life-delta toggle, in-log
+encounter diff, cross-log encounter diff, live tail mode, player
+overlay with HP-Δ indicator. See `RELEASES.md` for the running
 history.
 
 ## License
