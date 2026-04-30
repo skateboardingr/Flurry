@@ -1412,6 +1412,12 @@ class _State:
     since_hours: int = 8
     fights: Optional[List[FightResult]] = None
     heals: Optional[List[Heal]] = None
+    # Tracks `len(detector.completed)` at the moment we last snapshotted
+    # into `_State.fights`. In live mode the follower keeps appending to
+    # `detector.completed` after the initial walk; if this count drifts
+    # ahead, `_get_encounters_locked` re-snapshots so /api/session picks
+    # up the new encounters without a manual Refresh.
+    fights_count_at_snapshot: int = 0
     encounters: Optional[List[Encounter]] = None
     parser_stats: Optional[dict] = None
     # Sidecar state — pet owner assignments + manual encounter overrides.
@@ -1561,6 +1567,7 @@ def _ensure_combat_cached():
     _State.live_position = end_pos
     _State.fights = fights
     _State.heals = heals
+    _State.fights_count_at_snapshot = len(detector.completed)
     _set_progress('done', bytes_read=total, total_bytes=total)
     # Kick off the live follower if live mode is enabled. The follower
     # picks up at `live_position` (end of the initial walk) and keeps
@@ -1782,6 +1789,19 @@ def _get_encounters_locked() -> List[Encounter]:
     if _State.logfile is None:
         return []
     _ensure_combat_cached()
+    # Live-mode catch-up: the follower keeps appending to the detector
+    # after the initial parse, but `_State.fights/heals` are a frozen
+    # snapshot. If the detector has more completed fights than we last
+    # captured, re-snapshot and invalidate the encounter cache so the
+    # session view reflects newly-completed encounters.
+    detector = _State.detector
+    if (detector is not None and _State.fights is not None
+            and len(detector.completed) > _State.fights_count_at_snapshot):
+        fights, heals = detector.snapshot(include_in_progress=False)
+        _State.fights = fights
+        _State.heals = heals
+        _State.fights_count_at_snapshot = len(detector.completed)
+        _State.encounters = None
     if _State.encounters is None:
         sidecar = _State.sidecar or Sidecar.empty()
         if sidecar.pet_owners:

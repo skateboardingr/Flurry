@@ -469,6 +469,23 @@ class _CombatDetector:
         elif isinstance(ev, DeathMessage):
             if ev.victim in self.in_progress:
                 self._close(ev.victim, ev.timestamp, complete=True)
+            else:
+                # Late death: expire_stale may have already closed the
+                # fight before the death event landed. Common with tight
+                # gap_seconds, DoT kills, or live-mode log buffering.
+                # Walk back through recently-completed fights and flip
+                # the most recent matching slice to complete; bail out
+                # of the walk as soon as a fight is too old to be the
+                # one we're looking for.
+                grace = self.gap_seconds + 10
+                for f in reversed(self.completed):
+                    if f.end is None:
+                        continue
+                    if (ev.timestamp - f.end).total_seconds() > grace:
+                        break
+                    if f.target == ev.victim and not f.fight_complete:
+                        f.fight_complete = True
+                        break
         elif isinstance(ev, HealEvent):
             self.heals.append(Heal(
                 timestamp=ev.timestamp,

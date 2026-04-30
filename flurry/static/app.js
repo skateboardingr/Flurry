@@ -119,6 +119,21 @@ async function withParseProgress(promiseFactory, app, headline) {
 let _liveStatusPoll = null;
 let _liveLastEventTs = null;
 let _liveTicksSinceEvent = 0;
+// Tracks the id of the most-recent encounter that was actually
+// rendered into the session table. When the snapshot reports a newer
+// id AND we're between fights (no active_fight) AND we're on the
+// session view, we re-render so new rows pop in without a manual
+// Refresh. We skip during active combat — the user is watching the
+// overlay then, and re-renders during a pull are distracting flicker.
+// Encounters that completed mid-combat batch up and appear all at
+// once on the next quiet moment. Sentinel `undefined` distinguishes
+// "haven't seen the first poll yet" from "last poll said no encounters."
+let _liveRenderedEncounterId = undefined;
+
+function isOnSessionView() {
+  const h = location.hash || '';
+  return h === '' || h === '#' || h === '#/';
+}
 
 function startLiveStatusPoll() {
   if (_liveStatusPoll) return;  // already running
@@ -134,6 +149,18 @@ function startLiveStatusPoll() {
           _liveLastEventTs = d.last_event_ts;
         }
         applyLiveIndicator(d, _liveTicksSinceEvent);
+        // Auto-refresh session view between fights when a new
+        // encounter has formed since we last rendered.
+        const newId = d.last_encounter ? d.last_encounter.encounter_id : null;
+        if (_liveRenderedEncounterId === undefined) {
+          _liveRenderedEncounterId = newId;
+        } else if (newId !== _liveRenderedEncounterId
+                   && newId !== null
+                   && !d.active_fight
+                   && isOnSessionView()) {
+          _liveRenderedEncounterId = newId;
+          renderSession();
+        }
       }
     } catch (e) { /* keep polling */ }
   };

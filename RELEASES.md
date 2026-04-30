@@ -1,5 +1,30 @@
 # Releases
 
+## v0.6.3 — Live session catch-up
+
+- **Session view auto-refreshes between fights.** When a new
+  encounter forms in live mode (a separate engagement, not just an
+  extension of the existing one), the session table re-renders
+  within ~1s so the new row pops in without a manual Refresh. The
+  re-render is gated on "no active fight" so combat in progress
+  doesn't flicker the table — encounters that complete mid-combat
+  batch up and appear on the next quiet moment.
+
+  Server-side, `_State.fights/heals` were a frozen snapshot from
+  the initial parse, so the live follower's newly-completed fights
+  weren't showing up in `/api/session`. `_get_encounters_locked`
+  now re-snapshots from the detector when its `completed` count
+  has advanced past what we last captured.
+
+- **Late death messages now mark fights complete.** With tight
+  `gap_seconds` (e.g. 2s), the detector closes a fight 2s after
+  the last damage event. If the death message arrived later — DoT
+  kills, delayed log buffering — the fight stayed "Incomplete"
+  even though the mob died. The detector now walks back through
+  recently-completed fights (within `gap_seconds + 10s`) and flips
+  the matching slice to complete. DoT-killed and edge-of-gap
+  encounters now correctly show as Killed.
+
 ## v0.6.2 — Recap top 10
 
 - **Recap top damage** bumped from 8 to 10 rows. The Copy parse
