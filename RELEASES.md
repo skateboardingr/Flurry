@@ -1,5 +1,23 @@
 # Releases
 
+## v0.6.1 — Overlay copy polish
+
+Three fixes for the overlay's clipboard buttons after raid-night
+testing exposed friction:
+
+- **Copy short** now includes per-actor DPS, not just damage.
+  Format is `name dmg dps, name dmg dps, ...` — still channel-
+  friendly, with enough detail to be useful at a glance.
+- **Recap re-render skip.** The overlay polls every 250ms and was
+  rebuilding the recap HTML on every poll, which destroyed and
+  recreated the Copy buttons mid-click. A `mousedown` on one
+  generation of the button could land its `mouseup` on a fresh
+  replacement that never received the down — and the click event
+  was lost. The recap is now keyed by encounter start+end timestamps
+  and only re-rendered when a new encounter takes its place.
+- **"Copied!" confirmation duration** bumped from 1200ms → 2500ms
+  so the feedback is visible long enough to read.
+
 ## v0.6.0 — Live tail mode + player overlay
 
 Flurry now follows your log file in real time. With a log loaded and

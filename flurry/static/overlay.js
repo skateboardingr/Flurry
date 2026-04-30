@@ -161,6 +161,14 @@ function setStatus(state) {
 
 // ---- Render dispatch -------------------------------------------------
 
+// Tracks which view is currently in the DOM and, for recap, the
+// identity of the rendered encounter. Lets us skip re-rendering when
+// nothing changed — important for the recap because we poll every
+// 250ms and a re-render destroys the Copy buttons mid-click. (Active
+// view always re-renders since its counters tick every poll.)
+let _currentView = null;     // 'empty' | 'active' | 'recap' | 'waiting'
+let _currentRecapKey = null;
+
 function render(d) {
   // Title strip (top of the overlay): char name + status. Renders even
   // in the empty-state so the user sees connection state.
@@ -187,14 +195,29 @@ function render(d) {
 
   const content = document.getElementById('overlay-content');
   if (!d.logfile_basename) {
-    content.innerHTML = renderEmpty();
+    if (_currentView !== 'empty') content.innerHTML = renderEmpty();
+    _currentView = 'empty';
+    _currentRecapKey = null;
   } else if (d.active_fight) {
     content.innerHTML = renderActive(d.active_fight, d.char_name);
+    _currentView = 'active';
+    _currentRecapKey = null;
   } else if (d.last_encounter) {
-    content.innerHTML = renderRecap(d.last_encounter, d.char_name);
-    wireCopyButtons(d.last_encounter);
+    // Identify a completed encounter by start+end — once an encounter
+    // is "last", its data is frozen, so we only need to re-render when
+    // a different encounter takes its place.
+    const le = d.last_encounter;
+    const key = `${le.start || ''}|${le.end || ''}`;
+    if (_currentView !== 'recap' || _currentRecapKey !== key) {
+      content.innerHTML = renderRecap(le, d.char_name);
+      wireCopyButtons(le);
+      _currentRecapKey = key;
+    }
+    _currentView = 'recap';
   } else {
-    content.innerHTML = renderWaiting();
+    if (_currentView !== 'waiting') content.innerHTML = renderWaiting();
+    _currentView = 'waiting';
+    _currentRecapKey = null;
   }
 }
 
@@ -350,13 +373,12 @@ function formatTableParse(le) {
 }
 
 function formatCompactParse(le) {
-  // Ultra-short single-line. Top-5 names + raw damage only — fits any
-  // channel including /tell. Useful when you just want to brag about
-  // who did what without the % / dps detail.
+  // Ultra-short single-line. Top-5 names + damage + dps — fits any
+  // channel including /tell. Drops the % column to save room.
   const total = SHORT(le.raid_total_damage);
   const head = `${le.name} (${FMT_DUR(le.duration_seconds)}, ${total}):`;
   const top = _rowsForCopy(le).slice(0, 5)
-    .map(r => `${r.name} ${SHORT(r.damage)}`)
+    .map(r => `${r.name} ${SHORT(r.damage)} ${SHORT(r.dps)}dps`)
     .join(', ');
   return `${head} ${top}`;
 }
@@ -371,7 +393,7 @@ async function copyToClipboard(text, btn) {
       setTimeout(() => {
         btn.textContent = orig;
         btn.classList.remove('copied');
-      }, 1200);
+      }, 2500);
     }
   } catch (e) {
     // Some browsers block clipboard from non-HTTPS origins or non-user
@@ -390,7 +412,7 @@ async function copyToClipboard(text, btn) {
       setTimeout(() => {
         btn.classList.remove('copied');
         btn.textContent = btn.id === 'copy-table' ? 'Copy parse' : 'Copy short';
-      }, 1200);
+      }, 2500);
     }
   }
 }
