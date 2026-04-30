@@ -1,5 +1,130 @@
 # Releases
 
+## v0.6.0 — Live tail mode + player overlay
+
+Flurry now follows your log file in real time. With a log loaded and
+live mode on (default), a background follower thread tails the file
+every 250ms, parses appended events, and feeds them into the same
+detector the static parse populates. The session view, encounter
+detail, debug counters — everything in the main UI — keeps showing
+the latest state without a manual refresh after each fight.
+
+A new **player overlay** rides on top of this: a compact, always-on-
+top window with damage out / in and healing out / in counters during
+a fight, an HP-Δ strip, and a recap of the last encounter when you
+zone out. With one click in the main UI it goes click-through and
+sits over EQ as a HUD.
+
+### Live follower
+
+`_CombatDetector` is a new analyzer class that owns the fight-detection
+state machine — what `detect_combat` used to do walking through events,
+the detector does one event at a time via `feed_event`. The follower
+thread holds the log file open, polls 250ms for new bytes, parses
+complete lines, and feeds them in. Stale fights expire by **wall
+clock** on every tick so in-progress fights close after `gap_seconds`
+of real-world idle even when the log itself goes quiet.
+
+The detector survives across detection-param changes; log reloads
+follow normal cache invalidation. `/api/live/snapshot` returns the
+in-progress active fight + the last completed encounter on demand,
+and is read by both the main-UI live indicator and the overlay.
+
+### Player overlay
+
+A separate `/overlay` page (its own HTML / CSS / JS, served from
+`flurry/static/overlay.*`) polls `/api/live/snapshot` at 250ms and
+renders one of three views:
+
+- **Empty state** — "Load a log in the main window" while you size
+  and position the window for raid.
+- **Active fight** — four counters (damage out, damage in, healing
+  out, healing in) with per-second rates, a horizontal HP-Δ bar
+  (red when damage > heals, green when heals > damage), and the
+  current target name + duration. Counters aggregate across
+  in-progress fights so dmg-out from the boss fight, dmg-in from
+  the YOU fight, and pet damage all roll up to one set of numbers.
+- **Recap** — last encounter's name, duration, top damage rows,
+  and Copy buttons for clipboard parses.
+
+The active-fight target is picked by **highest cumulative damage**
+across the in-progress set, with a `received > dealt + healed`
+classifier filter to drop friendly PCs from the candidate list.
+The detector creates a fight per defender, so friendly tanks
+getting hit by mobs would otherwise show up as candidate targets
+and the displayed name would flicker between friendlies and
+enemies.
+
+### Pin overlay (always-on-top + click-through)
+
+A **Pin overlay** button in the main UI applies `WS_EX_TOPMOST` +
+`WS_EX_LAYERED` + `WS_EX_TRANSPARENT` to the overlay's browser
+window via Win32 ctypes (`SetWindowLongPtrW`), making it
+always-on-top and click-through over EQ. Pin/Unpin live in the
+main UI rather than inside the overlay because once click-through
+is on, the overlay itself can't be clicked.
+
+The overlay **auto-toggles click-through** based on what's
+currently rendered: during an active fight the click-through bit
+is on (HUD mode, mouse passes through to EQ); during the recap
+it's off (Copy buttons are clickable). Snapshot payload carries
+the current pin state and the overlay POSTs the bit on view
+transitions.
+
+### Clipboard parses
+
+Recap view has Copy buttons for the last encounter:
+
+- **Copy parse** — one-line `name dmg %% dps` rows separated by
+  ` | ` (EQ chat collapses multi-line, so a multi-line table is
+  unreadable in-game).
+- **Copy short** — top-5 names + raw damage, fits any channel
+  including `/tell`.
+- **Combine pets** toggle (default on) rolls your pet rows into
+  your row before formatting so the clipboard reads "you did N
+  total" rather than splitting your damage across multiple lines.
+- **Channel selector** persists in localStorage; defaults to
+  `/gsay`.
+
+### Mage / charmed pet rollup
+
+`apply_pet_owners` (introduced for necro + beastlord pets via the
+`<owner>'s pet` form) now rewrites mage and charmed pet names that
+EQ doesn't already attribute. The pet-owner editor on the encounter
+detail page populates the sidecar; the live snapshot applies the
+mapping every tick so the overlay's "you + your pets" counters
+include mage pets without needing per-edit cache busts.
+
+### Native file picker
+
+A **Browse…** button in the main UI opens the OS file picker via
+server-side `tkinter.filedialog.askopenfilename` so users can pick
+a log via the standard Windows dialog AND get live tracking on the
+original file. The drag-drop path (which copies to a temp dir and
+follows a static copy) still exists for users who prefer it.
+
+### Live-mode polish
+
+- **Persistent file handle** in the follower. Re-opening the log
+  every tick was hitting a Windows directory-cache-lag effect that
+  made the overlay update on a 5–7s cadence. A long-lived handle
+  reads freshly-appended bytes the moment they land.
+- **Wall-clock stale expiration** so a phantom in-progress fight
+  closes after `gap_seconds` of real-world idle, not just when the
+  log clock advances past the gap.
+- **`tests/sim_live_log.py`** — appends fake combat lines to a
+  temp log at a configurable rate so live-tail behavior can be
+  validated without an actual EQ session.
+
+### Out of scope for v0.6.0
+
+- **Configurable overlay layout** — the four-counter arrangement
+  is hardcoded.
+- **HP-Δ history chart** in the overlay — only the current rate
+  is shown, not a trace.
+- **Multi-character overlay** (one window per follower) — the
+  overlay follows whichever log the main UI has loaded.
+
 ## v0.5.0 — Cross-log encounter diff
 
 The diff view from v0.4.0 grows up: instead of comparing two encounters

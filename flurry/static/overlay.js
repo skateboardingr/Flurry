@@ -58,10 +58,53 @@ function setChannel(id) {
   localStorage.setItem(CHANNEL_KEY, id);
 }
 
+// Pet rollup toggle for the clipboard format. When on, the player's
+// pet rows are merged into the player's row (one combined number for
+// chat); when off, pets stay as separate rows. Default ON because the
+// most common ask is "how much did I do, total" rather than the
+// per-entity breakdown.
+const COMBINE_PETS_KEY = 'flurry.overlay.combinePets';
+function getCombinePets() {
+  const v = localStorage.getItem(COMBINE_PETS_KEY);
+  return v == null ? true : v === 'true';
+}
+function setCombinePets(on) {
+  localStorage.setItem(COMBINE_PETS_KEY, on ? 'true' : 'false');
+}
+
+// Merge the player's pet rows into the player row, recompute dps + pct,
+// drop the pet rows, and re-sort by damage desc. No-op if there's no
+// player row or no pet rows.
+function combinePetRows(rows, durationSec) {
+  if (!rows || rows.length === 0) return rows;
+  const playerIdx = rows.findIndex(r => r.is_you);
+  if (playerIdx < 0) return rows;
+  const petDmg = rows
+    .filter(r => r.is_your_pet)
+    .reduce((s, r) => s + (r.damage || 0), 0);
+  if (petDmg === 0) return rows;
+  const total = rows.reduce((s, r) => s + (r.damage || 0), 0);
+  const dur = Math.max(durationSec || 1, 1);
+  const player = {...rows[playerIdx]};
+  player.damage = (player.damage || 0) + petDmg;
+  player.dps = Math.round(player.damage / dur);
+  player.pct = total > 0
+    ? Math.round((player.damage / total) * 1000) / 10
+    : player.pct;
+  return rows
+    .filter(r => !r.is_your_pet)
+    .map(r => r.is_you ? player : r)
+    .sort((a, b) => (b.damage || 0) - (a.damage || 0));
+}
+
 // ---- Polling ---------------------------------------------------------
 
 let _lastEventTs = null;
 let _ticksSinceEvent = 0;
+// In-flight guard for the auto-pin flip: the snapshot poll fires every
+// 250ms, so without this we'd send a fresh POST every tick while the
+// server's first one was still landing.
+let _pinFlipInFlight = false;
 
 async function poll() {
   try {
@@ -83,9 +126,27 @@ async function poll() {
       _lastEventTs = d.last_event_ts;
     }
     render(d);
+    autoPin(d);
   } catch (e) {
     setStatus('idle');
   }
+}
+
+// When the user has pinned the overlay, drive the click-through bit
+// off the current view: HUD / counters during an active fight = pass
+// clicks through to EQ; recap = let the user click Copy buttons.
+// Skips when not pinned (server is in unpinned state, leave alone).
+function autoPin(d) {
+  if (!d.overlay_pinned || _pinFlipInFlight) return;
+  const wantClickThrough = !!d.active_fight;
+  if (wantClickThrough === d.overlay_click_through) return;
+  _pinFlipInFlight = true;
+  fetch('/api/overlay/pin', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({click_through: wantClickThrough}),
+  }).catch(() => {})
+    .finally(() => { _pinFlipInFlight = false; });
 }
 
 function setStatus(state) {
@@ -233,6 +294,7 @@ function renderRecap(le, charName) {
     `<option value="${c.id}" ${c.id === currentChannel ? 'selected' : ''}
              title="${escapeHTML(c.hint)}">${c.label}</option>`).join('');
 
+  const combineChecked = getCombinePets() ? 'checked' : '';
   return `
     <div class="recap-head">Last encounter</div>
     <div class="recap-name">${escapeHTML(le.name)}</div>
@@ -242,13 +304,18 @@ function renderRecap(le, charName) {
     <div class="top-list">${rows}</div>
     <div class="copy-row">
       <button class="copy-btn" id="copy-table"
-              title="Copy a multi-line table parse to your clipboard.">
-        Copy table
+              title="Copy a single-line parse with rank, name, damage, %, dps.">
+        Copy parse
       </button>
       <button class="copy-btn" id="copy-compact"
-              title="Copy a single-line parse to your clipboard.">
-        Copy compact
+              title="Copy an ultra-short top-5 parse (just names + damage).">
+        Copy short
       </button>
+      <label class="combine-toggle"
+             title="When on, your pets are rolled into your row in the pasted parse. When off, pets stay as separate entries.">
+        <input type="checkbox" id="combine-pets" ${combineChecked}>
+        combine pets
+      </label>
       <span class="channel-label">paste into</span>
       <select class="channel-select" id="channel-select"
               title="Where you intend to paste the parse. Saved locally — Flurry doesn't actually post for you.">
@@ -259,35 +326,36 @@ function renderRecap(le, charName) {
 
 // ---- Clipboard formatting + copy --------------------------------------
 
+function _rowsForCopy(le) {
+  // Apply the user's combine-pets preference, then return a fresh copy
+  // of the top-N rows ready for formatting.
+  const rows = le.top_damage || [];
+  if (getCombinePets()) return combinePetRows(rows, le.duration_seconds);
+  return rows.slice();
+}
+
 function formatTableParse(le) {
-  // Multi-line, monospace-friendly. Mirrors how raiders typically post
-  // a parse to chat — encounter header line + numbered top-N rows.
+  // Single-line, EQ-chat-friendly. Multi-line text gets collapsed to a
+  // single line in EQ chat (each /gsay is one line), so a multi-line
+  // table format ends up unreadable. We use ` | ` separators to keep
+  // the rank/name/damage chunks visually distinct on one line.
   const dur = FMT_DUR(le.duration_seconds);
   const total = SHORT(le.raid_total_damage);
-  const dur_secs = Math.max(le.duration_seconds || 1, 1);
-  const totalDps = SHORT(Math.round((le.raid_total_damage || 0) / dur_secs));
-  const lines = [`${le.name} — ${dur} — ${total} (${totalDps} dps)`];
-  const rows = (le.top_damage || []);
-  // Right-pad name column to align the numeric columns. Width = longest
-  // name + 2 spaces, capped so a single huge name doesn't blow up the
-  // whole format.
-  const nameWidth = Math.min(
-    20,
-    rows.reduce((w, r) => Math.max(w, r.name.length), 0) + 2);
-  rows.forEach((r, i) => {
-    const pos = String(i + 1) + '.';
-    const name = r.name.padEnd(nameWidth, ' ');
-    lines.push(`${pos} ${name} ${SHORT(r.damage)}  ${SHORT(r.dps)} dps  ${r.pct.toFixed(1)}%`);
-  });
-  return lines.join('\n');
+  const durSecs = Math.max(le.duration_seconds || 1, 1);
+  const totalDps = SHORT(Math.round((le.raid_total_damage || 0) / durSecs));
+  const head = `${le.name} ${dur} ${total} (${totalDps}dps)`;
+  const parts = _rowsForCopy(le).map((r, i) =>
+    `${i + 1}.${r.name} ${SHORT(r.damage)} ${r.pct.toFixed(0)}% ${SHORT(r.dps)}dps`);
+  return parts.length ? `${head} | ${parts.join(' | ')}` : head;
 }
 
 function formatCompactParse(le) {
-  // Single-line, suitable for /tell / shorter channels. Drop %s and
-  // DPS, keep a top few names + raw damage so it fits in a chat line.
+  // Ultra-short single-line. Top-5 names + raw damage only — fits any
+  // channel including /tell. Useful when you just want to brag about
+  // who did what without the % / dps detail.
   const total = SHORT(le.raid_total_damage);
   const head = `${le.name} (${FMT_DUR(le.duration_seconds)}, ${total}):`;
-  const top = (le.top_damage || []).slice(0, 5)
+  const top = _rowsForCopy(le).slice(0, 5)
     .map(r => `${r.name} ${SHORT(r.damage)}`)
     .join(', ');
   return `${head} ${top}`;
@@ -321,7 +389,7 @@ async function copyToClipboard(text, btn) {
       btn.classList.add('copied');
       setTimeout(() => {
         btn.classList.remove('copied');
-        btn.textContent = btn.id === 'copy-table' ? 'Copy table' : 'Copy compact';
+        btn.textContent = btn.id === 'copy-table' ? 'Copy parse' : 'Copy short';
       }, 1200);
     }
   }
@@ -331,12 +399,15 @@ function wireCopyButtons(le) {
   const tableBtn = document.getElementById('copy-table');
   const compactBtn = document.getElementById('copy-compact');
   const channelSel = document.getElementById('channel-select');
+  const combineCb = document.getElementById('combine-pets');
   if (tableBtn) tableBtn.addEventListener('click',
     () => copyToClipboard(formatTableParse(le), tableBtn));
   if (compactBtn) compactBtn.addEventListener('click',
     () => copyToClipboard(formatCompactParse(le), compactBtn));
   if (channelSel) channelSel.addEventListener('change',
     () => setChannel(channelSel.value));
+  if (combineCb) combineCb.addEventListener('change',
+    () => setCombinePets(combineCb.checked));
 }
 
 // ---- Boot ------------------------------------------------------------

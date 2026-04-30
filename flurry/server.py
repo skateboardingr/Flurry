@@ -27,7 +27,7 @@ import time
 import urllib.parse
 import webbrowser
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import BinaryIO, List, Optional
 
 import sys
 
@@ -147,20 +147,28 @@ def _find_overlay_window():
     return found[0] if found else None
 
 
-def _pin_overlay_window(alpha: int = 255) -> bool:
-    """Apply always-on-top + click-through to the overlay browser
-    window. `alpha` is 0-255 (255 = fully opaque). Returns True if the
-    window was found and styles were applied."""
+def _pin_overlay_window(alpha: int = 255, click_through: bool = True) -> bool:
+    """Apply always-on-top to the overlay browser window. `alpha` is
+    0-255 (255 = fully opaque). When `click_through` is True (the
+    default), mouse events pass through to whatever's underneath
+    (typically the EQ window) — useful as a HUD during combat. When
+    False, the overlay stays topmost but accepts mouse input — useful
+    when the recap is showing so the user can click Copy buttons.
+    Returns True if the window was found and styles were applied."""
     if _user32 is None:
         return False
     hwnd = _find_overlay_window()
     if hwnd is None:
         return False
-    # Add WS_EX_LAYERED (required for click-through to work) and
-    # WS_EX_TRANSPARENT (mouse events pass through to whatever's
-    # underneath — typically the EQ window).
+    # WS_EX_LAYERED is required for the alpha attribute to take effect.
+    # WS_EX_TRANSPARENT is the click-through bit — toggle separately
+    # since the caller may want one without the other.
     current = _GetWindowLongPtrW(hwnd, _GWL_EXSTYLE)
-    new_style = current | _WS_EX_LAYERED | _WS_EX_TRANSPARENT
+    new_style = current | _WS_EX_LAYERED
+    if click_through:
+        new_style |= _WS_EX_TRANSPARENT
+    else:
+        new_style &= ~_WS_EX_TRANSPARENT
     _SetWindowLongPtrW(hwnd, _GWL_EXSTYLE, new_style)
     # Required after setting WS_EX_LAYERED — without an alpha attr the
     # window can paint as fully transparent (invisible). 255 = opaque.
@@ -1186,6 +1194,8 @@ def _live_snapshot_payload() -> dict:
         'last_event_ts':    None,
         'active_fight':     None,
         'last_encounter':   None,
+        'overlay_pinned':   _State.overlay_pinned,
+        'overlay_click_through': _State.overlay_click_through,
     }
     if _State.logfile is None or _State.detector is None:
         return base
@@ -1238,22 +1248,55 @@ def _live_snapshot_payload() -> dict:
                 in_progress_snapshots, _ = apply_pet_owners(
                     in_progress_snapshots, [], pet_owners_map)
 
-            enemy_fights = [
-                f for f in in_progress_snapshots
-                if not _is_you(f.target)
-                and not f.target.endswith('`s pet')
-            ]
+            # Window covering all in-progress fights — used by both the
+            # side classifier and the player-metrics calculation below.
+            window_start = min(f.start for f in in_progress_snapshots)
+            window_end = max((f.end or f.start) for f in in_progress_snapshots)
+            window_dur = max((window_end - window_start).total_seconds(), 1.0)
+            heals_window = [h for h in all_heals
+                            if window_start <= h.timestamp <= window_end]
+
+            # Side classification — same `received > dealt + healed`
+            # rule the encounter detail uses. The detector creates one
+            # fight per defender, so a friendly PC who got hit by mobs
+            # has a defender-fight too; without this filter their name
+            # ends up in the candidate set and the displayed target can
+            # be a friendly. Healers are protected by counting healing
+            # output on the "active" side of the comparison.
+            received = {}
+            dealt = {}
+            for f in in_progress_snapshots:
+                tk = f.target.lower()
+                received[tk] = received.get(tk, 0) + f.total_damage
+                for atk, s in f.stats_by_attacker.items():
+                    ak = atk.lower()
+                    dealt[ak] = dealt.get(ak, 0) + s.damage
+            healed = {}
+            for h in heals_window:
+                hk = h.healer.lower()
+                healed[hk] = healed.get(hk, 0) + h.amount
+
+            def _is_enemy_target(name: str) -> bool:
+                if _is_you(name) or name.endswith('`s pet'):
+                    return False
+                nl = name.lower()
+                return received.get(nl, 0) > dealt.get(nl, 0) + healed.get(nl, 0)
+
+            enemy_fights = [f for f in in_progress_snapshots
+                            if _is_enemy_target(f.target)]
             if enemy_fights:
-                # Pick the most-recent enemy fight as the displayed
-                # target. (Multi-mob aware grouping was an earlier
-                # planned improvement; for now show the most recently
-                # active enemy.)
-                primary = max(enemy_fights, key=lambda f: f.end or f.start)
-                window_start = min(f.start for f in in_progress_snapshots)
-                window_end = max((f.end or f.start) for f in in_progress_snapshots)
-                window_dur = max((window_end - window_start).total_seconds(), 1.0)
-                heals_window = [h for h in all_heals
-                                if window_start <= h.timestamp <= window_end]
+                # Pick the highest-cumulative-damage enemy as the
+                # displayed target. Most-recent-hit was the obvious
+                # first choice but it flickers: any time damage lands
+                # on an add, the displayed name flips, even though the
+                # user is mostly fighting the boss. Highest-damage is
+                # stable — the boss outweighs adds across the
+                # encounter, so the name sticks. Tie-break by most
+                # recent so a fresh fight with zero damage doesn't
+                # lose to an older zero-damage fight forever.
+                primary = max(
+                    enemy_fights,
+                    key=lambda f: (f.total_damage, f.end or f.start))
                 # Player + their pets aggregated across all in-progress
                 # fights (so dmg-out on the boss fight + dmg-in on the
                 # YOU fight + pet damage on the boss fight all roll up
@@ -1402,6 +1445,13 @@ class _State:
     detector: Optional['_CombatDetector'] = None
     live_position: int = 0  # byte offset in logfile the follower has reached
     live_follower: Optional['_LiveFollower'] = None
+    # Overlay pin state. `overlay_pinned` is the user's intent (did they
+    # click Pin?); `overlay_click_through` is the currently-applied
+    # click-through bit, which the overlay drives auto-toggle on between
+    # active-fight (click-through ON, HUD mode) and recap (click-through
+    # OFF so Copy buttons are clickable).
+    overlay_pinned: bool = False
+    overlay_click_through: bool = True
     # Parse-progress dict, updated periodically by the parser thread and
     # read lock-free by /api/parse-status. State machine:
     #   'idle'    — no parse in progress; pct meaningless.
@@ -1538,17 +1588,21 @@ class _LiveFollower:
     """Background thread that tails the active log and feeds new events
     into the shared `_CombatDetector`.
 
-    Reads via plain `open(path, 'rb')` each tick. (An earlier version
-    chased a phantom Windows file-cache bug that turned out to be
-    misdiagnosis: the user was loading via /api/upload, which copies
-    to a temp dir and follows a static copy. Once /api/open / native
-    Browse landed, the simple Python read path proved correct.)"""
+    Holds a single `open(path, 'rb')` handle across ticks. Re-opening
+    the file every tick made the overlay update on a 5–7s cadence
+    instead of the 250ms poll interval — re-open seems to go through
+    a metadata path that lags behind what's actually on disk while EQ
+    is mid-stream. A persistent handle just `seek`s and `read`s on the
+    same fd, which sees freshly-appended bytes the moment they land."""
 
     def __init__(self, logfile: str, poll_interval_s: float = 0.25):
         self.logfile = logfile
         self.poll_interval_s = poll_interval_s
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Long-lived read handle; opened lazily on first tick, closed
+        # when the thread exits or the orphan-guard fires.
+        self._fh: Optional[BinaryIO] = None
 
     def start(self):
         if self._thread is not None and self._thread.is_alive():
@@ -1564,9 +1618,19 @@ class _LiveFollower:
         if t is not None:
             t.join(timeout=timeout)
         self._thread = None
+        self._close_handle()
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def _close_handle(self):
+        fh = self._fh
+        self._fh = None
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
 
     def _run(self):
         # Loop: read new bytes from the current position, parse complete
@@ -1575,24 +1639,27 @@ class _LiveFollower:
         # loop continues — a transient read failure shouldn't kill
         # live mode.
         from .parser import parse_line
-        while not self._stop.is_set():
-            try:
-                self._tick(parse_line)
-            except Exception:
-                # Quietly skip bad ticks. A persistent error shows up as
-                # the snapshot timestamp going stale, which the UI
-                # surfaces as the indicator dimming.
-                pass
-            # Wait with wake-up support so stop() returns quickly.
-            self._stop.wait(self.poll_interval_s)
+        try:
+            while not self._stop.is_set():
+                try:
+                    self._tick(parse_line)
+                except Exception:
+                    # Quietly skip bad ticks. A persistent error shows up as
+                    # the snapshot timestamp going stale, which the UI
+                    # surfaces as the indicator dimming.
+                    pass
+                # Wait with wake-up support so stop() returns quickly.
+                self._stop.wait(self.poll_interval_s)
+        finally:
+            # Belt-and-braces: if `stop()` raced or we exited via an
+            # orphan-guard, make sure we don't leak the fd.
+            self._close_handle()
 
     def _tick(self, parse_line):
-        # Read newly-appended bytes from `live_position` to EOF. Open
-        # afresh each tick so a log rotation (file replaced) doesn't
-        # strand us on a stale handle.
+        # Read newly-appended bytes from `live_position` to EOF using a
+        # persistent handle that's reused across ticks (see class doc).
         if not os.path.isfile(self.logfile):
             return
-        size = os.path.getsize(self.logfile)
         with _State.fights_lock:
             # Per-tick guards: if a different logfile is now active or
             # we've been replaced as the current follower, this thread
@@ -1603,25 +1670,30 @@ class _LiveFollower:
             if (_State.logfile != self.logfile
                     or _State.live_follower is not self):
                 self._stop.set()
+                self._close_handle()
                 return
             position = _State.live_position
             detector = _State.detector
             if detector is None:
                 return
-            has_new_bytes = position < size
         # Read outside the lock (I/O can be slow); decode + parse
         # without touching shared state. Falls through to the
         # wall-clock expire_stale at the end even if there are no new
         # bytes, so phantom in-progress fights still close after
         # gap_seconds of real-world idle.
-        chunk = b''
-        if has_new_bytes:
+        if self._fh is None:
             try:
-                with open(self.logfile, 'rb') as f:
-                    f.seek(position)
-                    chunk = f.read(size - position)
+                self._fh = open(self.logfile, 'rb')
             except OSError:
-                chunk = b''
+                return
+        chunk = b''
+        try:
+            self._fh.seek(position)
+            chunk = self._fh.read()
+        except OSError:
+            # Handle went bad — drop it and let the next tick re-open.
+            self._close_handle()
+            return
         if chunk:
             try:
                 text = chunk.decode('utf-8', errors='replace')
@@ -2281,13 +2353,23 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     self.send_error(400, 'alpha must be an integer 0-255')
                     return
-                ok = _pin_overlay_window(alpha=alpha)
+                # `click_through` lets the overlay toggle just the
+                # click-through bit on/off without changing pinned
+                # intent — the overlay drives this from active-fight
+                # vs recap state so Copy buttons stay clickable.
+                click_through = bool(data.get('click_through', True))
+                ok = _pin_overlay_window(alpha=alpha,
+                                          click_through=click_through)
                 if not ok:
                     self.send_error(404, 'overlay window not found; '
                                          'open it via Pop out overlay first')
                     return
+                with _State.fights_lock:
+                    _State.overlay_pinned = True
+                    _State.overlay_click_through = click_through
                 self._serve_json({
                     'pinned': True,
+                    'click_through': click_through,
                     'alpha': max(0, min(255, alpha)),
                 })
             elif path == '/api/overlay/unpin':
@@ -2297,6 +2379,9 @@ class FlurryHandler(http.server.BaseHTTPRequestHandler):
                     self.send_error(400, 'overlay pinning is Windows-only')
                     return
                 ok = _unpin_overlay_window()
+                with _State.fights_lock:
+                    _State.overlay_pinned = False
+                    _State.overlay_click_through = True
                 self._serve_json({'pinned': False, 'found': ok})
             elif path == '/api/live/toggle':
                 # Turn the live follower on or off. Body: {"enabled": bool}.

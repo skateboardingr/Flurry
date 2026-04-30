@@ -275,6 +275,22 @@ body.overlay-body {
   letter-spacing: 0.04em;
   margin-left: auto;
 }
+.combine-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  user-select: none;
+}
+.combine-toggle input[type="checkbox"] {
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
 
 /* When the window is narrow, drop the counter grid to a single column
    so the values fit. The user is in control of window size. */
