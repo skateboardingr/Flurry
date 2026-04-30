@@ -595,7 +595,7 @@ async function renderSession() {
     overlayBtn.addEventListener('click', () => {
       // Modest default size. User can resize once it's open.
       window.open('/overlay', 'flurry-overlay',
-                  'width=320,height=380,resizable=yes,menubar=no,toolbar=no,location=no,status=no');
+                  'width=320,height=400,resizable=yes,menubar=no,toolbar=no,location=no,status=no');
     });
     sessActions.appendChild(overlayBtn);
 

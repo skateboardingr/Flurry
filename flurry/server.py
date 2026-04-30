@@ -1172,7 +1172,7 @@ def _live_last_encounter(encounters: List[Encounter],
         'raid_total_damage':  e.total_damage,
         'you':                _player_metrics(flat, heals_window,
                                               char_name=char_name),
-        'top_damage':         _top_damage(flat, n=8, char_name=char_name),
+        'top_damage':         _top_damage(flat, n=10, char_name=char_name),
         'top_healing':        _top_healing(heals_window,
                                            e.duration_seconds, n=5),
     }

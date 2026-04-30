@@ -1,5 +1,14 @@
 # Releases
 
+## v0.6.2 — Recap top 10
+
+- **Recap top damage** bumped from 8 to 10 rows. The Copy parse
+  output includes all 10; Copy short stays at top 5.
+- **Default overlay window height** bumped from 380 to 400 to fit
+  the two extra rows on first open. Browsers remember the named
+  window's last size, so close the existing overlay window before
+  Pop out overlay to see the new default.
+
 ## v0.6.1 — Overlay copy polish
 
 Three fixes for the overlay's clipboard buttons after raid-night
