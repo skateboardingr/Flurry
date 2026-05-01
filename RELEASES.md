@@ -20,7 +20,7 @@
   alongside the raid (their damage lands on the boss, an enemy)
   stay in the top-10 where they belong.
 
-
+## v0.6.4 — Overlay performance + parser coverage
 
 - **Live overlay no longer jams in long sessions.** The
   `/api/live/snapshot` endpoint, polled ~4×/sec by the overlay,
