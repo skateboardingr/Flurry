@@ -1,6 +1,26 @@
 # Releases
 
-## v0.6.4 — Overlay performance + parser coverage
+## v0.6.5 — Recap enemy filter: catch hit-and-run adds
+
+- **Mobs that hit hard and died fast were sneaking into the recap
+  top-10.** v0.6.4 added an enemy filter to the overlay's recap
+  list, but it was a single-pass classifier (`received > dealt +
+  healed` ⇒ enemy). That correctly caught tank-and-spank bosses
+  but missed adds whose damage to the raid exceeded what the raid
+  did to them before they died — a kobold zealot that landed 50M
+  on the raid before being charm-killed reads as friendly under
+  the single-pass rule because dealt > received.
+
+  The recap now runs the same two-pass classifier the encounter
+  detail's Friendlies/Enemies split has always used. Pass 2 looks
+  at where each still-friendly attacker's damage actually landed:
+  if it went mostly to (still-friendly) names, the attacker is
+  flipped to enemy. Pets and any actor that healed in-window are
+  decisively friendly and skipped — so charmed pets that fight
+  alongside the raid (their damage lands on the boss, an enemy)
+  stay in the top-10 where they belong.
+
+
 
 - **Live overlay no longer jams in long sessions.** The
   `/api/live/snapshot` endpoint, polled ~4×/sec by the overlay,

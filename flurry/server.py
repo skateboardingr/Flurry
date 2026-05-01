@@ -1096,9 +1096,17 @@ def _player_metrics(fight: FightResult, heals_in_window: List[Heal],
 
 def _enemy_names(fight: FightResult,
                  heals_in_window: List[Heal]) -> set:
-    """Return lowercased names that read as enemies in the given fight:
-    those who received more damage than they dealt + healed. Same rule
-    the encounter-detail Friendlies/Enemies split uses (server.py:2803).
+    """Return lowercased names that read as enemies in the given fight.
+
+    Two-pass classifier mirrors the encounter-detail Friendlies/Enemies
+    split (server.py:2910 + 3004):
+      - Pass 1: received > dealt + healed → enemy. Catches tank-and-spank
+        bosses that take far more than they deal back.
+      - Pass 2: among names still classified friendly, any whose damage
+        landed mostly on (still-friendly) names is flipped to enemy.
+        Catches adds that hit hard and died fast (dealt > received) —
+        without this, a nihil arcanist that landed 50M on the raid
+        before being charm-killed shows up in the recap's top-10.
 
     Used to filter the recap's top-damage list — without this, mobs
     that hit players accumulate damage in the merged encounter's
@@ -1108,9 +1116,12 @@ def _enemy_names(fight: FightResult,
     for atk, s in fight.stats_by_attacker.items():
         dealt[atk.lower()] = dealt.get(atk.lower(), 0) + s.damage
     received: dict = {}
-    for (_atk, defender), d in fight.defends_by_pair.items():
+    dealt_to_by_atk: dict = {}  # attacker_lower -> {defender_lower: dmg}
+    for (atk, defender), d in fight.defends_by_pair.items():
         dk = defender.lower()
         received[dk] = received.get(dk, 0) + d.damage_taken
+        bucket = dealt_to_by_atk.setdefault(atk.lower(), {})
+        bucket[dk] = bucket.get(dk, 0) + d.damage_taken
     healed: dict = {}
     for h in heals_in_window:
         hk = h.healer.lower()
@@ -1118,6 +1129,27 @@ def _enemy_names(fight: FightResult,
     enemies = set()
     for name in set(list(dealt.keys()) + list(received.keys())):
         if received.get(name, 0) > dealt.get(name, 0) + healed.get(name, 0):
+            enemies.add(name)
+    # Pass 2: friendlies whose damage landed mostly on other friendlies
+    # are almost certainly enemies that just don't show up as a target
+    # themselves. Skip pets (always friendly) and anyone who healed
+    # in-window (decisively friendly — covers cleric/druid mains whose
+    # only "damage" is a DS proc on a buffed tank).
+    for name in list(dealt.keys()):
+        if name in enemies:
+            continue
+        if name.endswith('`s pet'):
+            continue
+        if healed.get(name, 0) > 0:
+            continue
+        to_friendlies = 0
+        to_enemies = 0
+        for tgt_lo, dmg in dealt_to_by_atk.get(name, {}).items():
+            if tgt_lo in enemies:
+                to_enemies += dmg
+            else:
+                to_friendlies += dmg
+        if to_friendlies > to_enemies:
             enemies.add(name)
     return enemies
 

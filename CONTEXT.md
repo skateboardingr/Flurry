@@ -1154,17 +1154,22 @@ non-obvious choices:
   without a new fight, no synthesis happens and the overlay
   flips to recap.
 
-- **Recap top-damage filters enemies via the `received >
-  dealt + healed` classifier.** `merge_encounter` flattens an
-  encounter's per-fight stats into a single FightResult whose
-  `stats_by_attacker` contains everyone who dealt damage —
-  including mobs that hit players (those have stats from the
-  defender-target slices). Without filtering, a kobold zealot
-  or gnoll thug shows up alongside the raid in the recap's
-  top-10. `_enemy_names(fight, heals)` returns the lowercased
-  set of names that classify as enemies (same rule the
-  encounter-detail Friendlies/Enemies split uses); `_top_damage`
-  takes an `exclude_lower` set to drop them.
+- **Recap top-damage filters enemies via a two-pass classifier.**
+  `merge_encounter` flattens an encounter's per-fight stats into a
+  single FightResult whose `stats_by_attacker` contains everyone
+  who dealt damage — including mobs that hit players (those have
+  stats from the defender-target slices). Without filtering, a
+  kobold zealot or gnoll thug shows up alongside the raid in the
+  recap's top-10. `_enemy_names(fight, heals)` runs the same two
+  passes the encounter-detail Friendlies/Enemies split does:
+  pass 1 flags `received > dealt + healed` (catches tank-and-spank
+  bosses), pass 2 flips friendlies whose damage landed mostly on
+  other friendlies (catches adds that hit hard then died fast —
+  e.g. an arcanist that landed 50M on the raid before being charm-
+  killed reads as friendly under pass 1 alone because dealt >
+  received). Pass 2 skips pets and any actor that healed in-window
+  (decisively friendly). `_top_damage` takes an `exclude_lower` set
+  to drop the resulting names.
 
 ## Known issues / debt
 
