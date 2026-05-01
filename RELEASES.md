@@ -1,5 +1,71 @@
 # Releases
 
+## v0.6.4 — Overlay performance + parser coverage
+
+- **Live overlay no longer jams in long sessions.** The
+  `/api/live/snapshot` endpoint, polled ~4×/sec by the overlay,
+  was recomputing `apply_pet_owners` + `group_into_encounters` +
+  the recap's merged encounter and enemy classification on every
+  poll. Around ~600 completed fights this hit 3 sec per snapshot;
+  at ~2400 it climbed past 8 sec — far longer than the 250ms poll
+  deadline, so requests piled up and the overlay appeared frozen
+  for multiple seconds at a time. The recap-side work is now
+  cached on a key derived from `(len(completed), len(heals),
+  id(sidecar), pet-owner count, manual-encounter content,
+  encounter_gap_seconds)` and reused across polls until any of
+  those change. Cold cache (first poll after a fight closes)
+  is still the same single-shot work; subsequent polls — the vast
+  majority — drop to single-digit milliseconds. Active-fight
+  payload stays uncached because it depends on the in-progress
+  set which changes every tick, but it's also cheap.
+
+- **Inter-fight grace window for the recap trigger.** The fight
+  `gap_seconds` (often 2-3s in tight configs) is too small to use
+  as the "show recap" trigger — the overlay would flicker into
+  recap and back during target swaps and finishing-the-last-add
+  lulls within an encounter. The overlay now stays in HUD layout
+  for `encounter_gap_seconds` of wall time after the last real
+  active fight closes, showing the most-recent encounter's
+  totals frozen. Once the encounter is genuinely over (no new
+  fight starts within the window), the overlay flips to recap.
+  The synthesized HUD drops click-through so you can interact
+  with the frozen display — real active fights still keep
+  click-through on for unobstructed gameplay.
+
+- **Recap top-damage filters enemies.** `merge_encounter`
+  flattens an encounter's per-fight stats into one FightResult
+  whose `stats_by_attacker` includes every actor that dealt
+  damage — including mobs that hit players (those have stats
+  from the defender-target slices). Without filtering, a kobold
+  zealot or gnoll thug landing 1-2M damage on tanks would show
+  up alongside the raid in the recap's top-10. The recap now
+  classifies enemies via `received > dealt + healed` (same rule
+  the encounter-detail Friendlies/Enemies split uses) and
+  excludes them from the top list.
+
+### Parser coverage
+
+- **`You have slain X!`** — EQ writes this when YOU deliver the
+  killing blow, instead of the third-person `X has been slain
+  by You!`. The parser was missing it, so every solo kill
+  silently expired via `gap_seconds` and got marked Incomplete
+  in the session table. Common in solo trash sessions where
+  every row was yellow even though the mobs all died.
+
+- **Pet self-heal procs.** EQ's "Theft of Essence" weapon
+  procs (mage pet self-heals, also seen on PCs with the proc on
+  their gear) are written as `X has been healed for N hit
+  points by Theft of Essence Effect XVII.` — note the missing
+  `by HEALER` clause. The parser now matches this shape and
+  attributes the heal as `healer == target`, so it flows into
+  healing-received without fragmenting per-healer rollups.
+
+- **`Pain and suffering strikes you for N damage!`** — the
+  unconscious bleed-out mechanic when you're at 0 HP. Always
+  targets You; routed to attacker `(unconscious)` (separate
+  sentinel from `(unattributed)` and `(falling)`) so it shows
+  up in damage-taken views without faking a mob attacker.
+
 ## v0.6.3 — Live session catch-up
 
 - **Session view auto-refreshes between fights.** When a new
