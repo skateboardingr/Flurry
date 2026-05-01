@@ -1119,6 +1119,53 @@ non-obvious choices:
   itself — so the unpin control has to be reachable from
   somewhere always-clickable.
 
+- **Snapshot cache for the recap-side work.** `_live_snapshot`
+  is hit ~4×/sec by the overlay poll. Recomputing
+  `apply_pet_owners` + `group_into_encounters` + the recap's
+  `merge_encounter` + `_enemy_names` over every completed fight
+  on every poll measured at >3 sec per snapshot once a session
+  passed ~600 fights, and >8 sec at ~2400 — completely jamming
+  the overlay because each request took longer than the next
+  poll's deadline. `_State.snapshot_cache` keys on
+  `(len(completed), len(heals), id(sidecar), pet-owner count,
+   manual-encounter content tuple, encounter_gap_seconds)` and
+  reuses the previous tick's encounters list + last-encounter
+  payload until any of those change. Active-fight payload is
+  NOT cached — it depends on `in_progress` which changes every
+  tick, but it's also cheap (only walks the small in-progress
+  set, not the whole completed list). Cache resets on log swap
+  and on `_invalidate_caches_locked(drop_combat=True)`.
+
+- **Inter-fight grace window for the overlay's recap trigger.**
+  The fight `gap_seconds` (default 15s, often 2-3s in tight
+  configs) is too small as a recap trigger — between fights
+  within an encounter (target swap, finishing the last add) the
+  overlay would flicker into recap and back. `_State.last_active_wall`
+  tracks the monotonic wall time of the last REAL active fight
+  (not the synthesized variant). When in-progress is empty and
+  `monotonic() - last_active_wall <= encounter_gap_seconds`,
+  `_live_snapshot` synthesizes an `active_fight` payload from
+  the most recent encounter's totals (frozen — counters don't
+  update until the next real fight starts) and tags it
+  `synthesized: True`. The overlay renders this as the HUD but
+  drops click-through (synthesized = post-combat data, no
+  reason to block clicks) so you can interact with the frozen
+  display. Once `encounter_gap_seconds` of wall time elapses
+  without a new fight, no synthesis happens and the overlay
+  flips to recap.
+
+- **Recap top-damage filters enemies via the `received >
+  dealt + healed` classifier.** `merge_encounter` flattens an
+  encounter's per-fight stats into a single FightResult whose
+  `stats_by_attacker` contains everyone who dealt damage —
+  including mobs that hit players (those have stats from the
+  defender-target slices). Without filtering, a kobold zealot
+  or gnoll thug shows up alongside the raid in the recap's
+  top-10. `_enemy_names(fight, heals)` returns the lowercased
+  set of names that classify as enemies (same rule the
+  encounter-detail Friendlies/Enemies split uses); `_top_damage`
+  takes an `exclude_lower` set to drop them.
+
 ## Known issues / debt
 
 - **Test fixture path is hardcoded** to `/mnt/user-data/uploads/...` in

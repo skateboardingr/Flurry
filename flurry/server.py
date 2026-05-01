@@ -1094,10 +1094,45 @@ def _player_metrics(fight: FightResult, heals_in_window: List[Heal],
     }
 
 
+def _enemy_names(fight: FightResult,
+                 heals_in_window: List[Heal]) -> set:
+    """Return lowercased names that read as enemies in the given fight:
+    those who received more damage than they dealt + healed. Same rule
+    the encounter-detail Friendlies/Enemies split uses (server.py:2803).
+
+    Used to filter the recap's top-damage list — without this, mobs
+    that hit players accumulate damage in the merged encounter's
+    `stats_by_attacker` and show up in the top-10 alongside the raid.
+    """
+    dealt: dict = {}
+    for atk, s in fight.stats_by_attacker.items():
+        dealt[atk.lower()] = dealt.get(atk.lower(), 0) + s.damage
+    received: dict = {}
+    for (_atk, defender), d in fight.defends_by_pair.items():
+        dk = defender.lower()
+        received[dk] = received.get(dk, 0) + d.damage_taken
+    healed: dict = {}
+    for h in heals_in_window:
+        hk = h.healer.lower()
+        healed[hk] = healed.get(hk, 0) + h.amount
+    enemies = set()
+    for name in set(list(dealt.keys()) + list(received.keys())):
+        if received.get(name, 0) > dealt.get(name, 0) + healed.get(name, 0):
+            enemies.add(name)
+    return enemies
+
+
 def _top_damage(fight: FightResult, n: int = 8,
-                char_name: Optional[str] = None) -> List[dict]:
+                char_name: Optional[str] = None,
+                exclude_lower: Optional[set] = None) -> List[dict]:
     """Top-N damage dealers in the fight, sorted desc. Used by the
     overlay's recap state and by the clipboard copy.
+
+    `exclude_lower` is a set of lowercased names to skip — typically
+    enemies in the encounter, so a mob hitting players doesn't appear
+    alongside the raid's damage. Falls back to a cheap target-name
+    match when not provided (kept so callers without aggregate state
+    handy still drop the boss-as-self-attacker edge case).
 
     Each row carries `is_you` and `is_your_pet` flags so the front-end
     can style the player's own contributions distinctly (player +
@@ -1110,13 +1145,11 @@ def _top_damage(fight: FightResult, n: int = 8,
                     key=lambda x: x.damage, reverse=True):
         if s.damage <= 0:
             continue
-        # Skip the boss/adds (enemies). Cheap heuristic that works for
-        # the typical raid log: the target is exactly one of the
-        # attackers we want to exclude. Friendlies vs enemies is the
-        # encounter-detail rule but it requires aggregate state we
-        # don't want to recompute on every fast poll; the target-name
-        # exclusion catches the vast majority.
-        if s.attacker.lower() == fight.target.lower():
+        atk_lower = s.attacker.lower()
+        if exclude_lower is not None:
+            if atk_lower in exclude_lower:
+                continue
+        elif atk_lower == fight.target.lower():
             continue
         rows.append({
             'name':       s.attacker,
@@ -1162,6 +1195,12 @@ def _live_last_encounter(encounters: List[Encounter],
     # populated by group_into_encounters but the overlay's player
     # metrics need the same shape as the active-fight path.
     heals_window = list(e.heals)
+    # Filter enemies out of the recap's top-damage list. Without this,
+    # mobs that landed hits on players (kobold zealot, gnoll thug, etc.)
+    # accumulate damage in the merged encounter and show up alongside
+    # the raid in the top-10 — the recap is meant to read as "your
+    # raid's parse on this encounter", so enemies don't belong.
+    enemies = _enemy_names(flat, heals_window)
     return {
         'encounter_id':       e.encounter_id,
         'name':               _encounter_summary(e)['name'],
@@ -1172,7 +1211,8 @@ def _live_last_encounter(encounters: List[Encounter],
         'raid_total_damage':  e.total_damage,
         'you':                _player_metrics(flat, heals_window,
                                               char_name=char_name),
-        'top_damage':         _top_damage(flat, n=10, char_name=char_name),
+        'top_damage':         _top_damage(flat, n=10, char_name=char_name,
+                                          exclude_lower=enemies),
         'top_healing':        _top_healing(heals_window,
                                            e.duration_seconds, n=5),
     }
@@ -1345,18 +1385,92 @@ def _live_snapshot_payload() -> dict:
         # fights). Apply pet owners + manual groups the same way the
         # main UI does so the recap names match.
         sidecar = _State.sidecar or Sidecar.empty()
-        if sidecar.pet_owners:
-            fights2, heals2 = apply_pet_owners(
-                completed, all_heals, sidecar.pet_owners)
+        # Cache the recap-side work — apply_pet_owners, group_into_encounters,
+        # and the heavy _live_last_encounter (merge_encounter +
+        # _enemy_names) all walk every completed fight, but `completed`
+        # only grows on fight closures, not on every overlay poll. In a
+        # long raid session this work measured at >3 sec per snapshot
+        # against ~650 fights, blowing past the 250 ms overlay poll
+        # interval and making the overlay appear to lag by several
+        # seconds. Cache key invalidates on:
+        #   - len(completed) growth (new fight closed)
+        #   - len(heals) growth (new heal)
+        #   - sidecar reassignment (id changes)
+        #   - pet-owner edits (length changes; in-place renames also
+        #     trigger drop_combat=True which resets the detector and
+        #     thus len(completed))
+        #   - manual-group edits (content tuple changes)
+        # Param changes (gap_seconds, encounter_gap_seconds) clear the
+        # detector via _invalidate_caches_locked, so they invalidate
+        # transitively through len(completed).
+        manual_key = tuple(
+            (tuple(m.fight_keys), m.name)
+            for m in sidecar.manual_encounters)
+        cache_key = (
+            len(completed),
+            len(all_heals),
+            id(sidecar),
+            len(sidecar.pet_owners or {}),
+            manual_key,
+            _State.encounter_gap_seconds,
+        )
+        cached = _State.snapshot_cache
+        if cached is not None and cached[0] == cache_key:
+            encounters, last_enc = cached[1], cached[2]
         else:
-            fights2, heals2 = completed, all_heals
-        encounters = group_into_encounters(
-            fights2,
-            gap_seconds=_State.encounter_gap_seconds,
-            heals=heals2,
-            manual_groups=sidecar.manual_groups_for_grouper())
-        last_enc = _live_last_encounter(encounters, all_heals,
-                                        char_name=char_name)
+            if sidecar.pet_owners:
+                fights2, heals2 = apply_pet_owners(
+                    completed, all_heals, sidecar.pet_owners)
+            else:
+                fights2, heals2 = completed, all_heals
+            encounters = group_into_encounters(
+                fights2,
+                gap_seconds=_State.encounter_gap_seconds,
+                heals=heals2,
+                manual_groups=sidecar.manual_groups_for_grouper())
+            last_enc = _live_last_encounter(encounters, all_heals,
+                                            char_name=char_name)
+            _State.snapshot_cache = (cache_key, encounters, last_enc)
+
+        # Inter-fight grace window: keep the overlay in HUD mode for
+        # `encounter_gap_seconds` of wall-clock after the last
+        # in-progress fight closes, so the overlay doesn't flicker
+        # into recap and back during target swaps or finishing-the-
+        # last-add lulls within an encounter. The HUD displays the
+        # most recent encounter's totals (frozen — counters won't
+        # update until a new in-progress fight starts). Once the
+        # grace window expires, `active` stays None and the overlay
+        # flips to recap mode naturally.
+        #
+        # `last_active_wall` is only refreshed on REAL in-progress
+        # active fights; the synthesized grace-window active doesn't
+        # bump it, so the window can't extend itself indefinitely.
+        if active is not None:
+            _State.last_active_wall = time.monotonic()
+            # Real in-progress active fights default to non-synthesized
+            # so the front-end's click-through gate keys on this flag
+            # alone (rather than maintaining its own list of fields).
+            active['synthesized'] = False
+        elif (last_enc is not None
+              and _State.last_active_wall > 0):
+            elapsed = time.monotonic() - _State.last_active_wall
+            if elapsed <= _State.encounter_gap_seconds:
+                # `synthesized=True` flags this as the grace-window
+                # frozen HUD (no live combat, just the most-recent
+                # encounter's totals shown in HUD layout). The overlay
+                # drops click-through when it sees this so the user can
+                # interact with the frozen data — click-through-ON is
+                # only appropriate during actual active combat.
+                active = {
+                    'target':             last_enc['name'],
+                    'start':              last_enc['start'],
+                    'duration_seconds':   last_enc['duration_seconds'],
+                    'raid_total_damage':  last_enc['raid_total_damage'],
+                    'you':                last_enc['you'],
+                    'top_damage':         last_enc['top_damage'],
+                    'top_healing':        last_enc['top_healing'],
+                    'synthesized':        True,
+                }
 
         # Debug counters to diagnose "live tail not working" reports —
         # these surface in /api/live/snapshot so the user can compare
@@ -1458,6 +1572,30 @@ class _State:
     # OFF so Copy buttons are clickable).
     overlay_pinned: bool = False
     overlay_click_through: bool = True
+    # Monotonic wall-clock timestamp of the last snapshot tick where a
+    # REAL active fight (in-progress, not the synthesized grace-window
+    # variant below) was returned. Drives the inter-fight grace window
+    # in `_live_snapshot` — when in-progress goes empty, we keep
+    # showing the HUD for `encounter_gap_seconds` of wall time so the
+    # overlay doesn't flicker into recap and back during target swaps
+    # or finishing-the-last-add lulls within an encounter. 0.0 sentinel
+    # means "no active fight ever recorded" — first-tick handling.
+    last_active_wall: float = 0.0
+    # Cache for the per-tick recap-side snapshot work (apply_pet_owners,
+    # group_into_encounters, merge_encounter, _enemy_names). Without
+    # this cache, every overlay poll (~4×/sec) repeats the same O(N)
+    # walk over every completed fight even though `completed` only
+    # grows on real fight closures — measured at >3000 ms per snapshot
+    # in long sessions, far exceeding the 250 ms poll interval, which
+    # made the overlay appear to lag by multiple seconds.
+    #
+    # Tuple shape: (cache_key, encounters, last_enc_payload).
+    # Key includes len(completed), len(heals), id(sidecar), pet-owner
+    # count, and a content tuple of manual_groups so any combination
+    # of fight closure / heal landing / sidecar edit invalidates it.
+    # Active-fight payload is NOT cached — it depends on in_progress
+    # which changes every tick.
+    snapshot_cache: Optional[tuple] = None
     # Parse-progress dict, updated periodically by the parser thread and
     # read lock-free by /api/parse-status. State machine:
     #   'idle'    — no parse in progress; pct meaningless.
@@ -1610,11 +1748,6 @@ class _LiveFollower:
         # Long-lived read handle; opened lazily on first tick, closed
         # when the thread exits or the orphan-guard fires.
         self._fh: Optional[BinaryIO] = None
-        # Wall-clock (monotonic) timestamp of the last tick that read new
-        # bytes from the log. Drives the gating on wall-clock expire_stale
-        # below — see _tick. Seeded at start so the first idle window
-        # is measured from when we began following, not from epoch.
-        self._last_log_activity_wall: float = time.monotonic()
 
     def start(self):
         if self._thread is not None and self._thread.is_alive():
@@ -1700,8 +1833,24 @@ class _LiveFollower:
                 return
         chunk = b''
         try:
-            self._fh.seek(position)
-            chunk = self._fh.read()
+            # Use os.fstat on the open fd — NOT `self._fh.read()` with
+            # no size arg. On Windows, with a file being actively
+            # appended to by another process (EQ), the open handle's
+            # view of EOF can lag the actual file size by several
+            # seconds because the OS doesn't refresh the cached size
+            # on the fd between writes by the other process. `read()`
+            # honors that stale EOF and returns only as far as it
+            # sees, producing 5–7s update lag in the overlay even
+            # though the persistent handle was supposed to fix that.
+            # `os.fstat(fd)` forces a fresh size lookup against the
+            # kernel's authoritative inode (no directory metadata
+            # cache hop, so this is much cheaper than the full
+            # re-open path that the persistent handle replaced) and
+            # lets us read EXACTLY `size - position` bytes.
+            size = os.fstat(self._fh.fileno()).st_size
+            if size > position:
+                self._fh.seek(position)
+                chunk = self._fh.read(size - position)
         except OSError:
             # Handle went bad — drop it and let the next tick re-open.
             self._close_handle()
@@ -1718,11 +1867,6 @@ class _LiveFollower:
             if last_nl >= 0:
                 complete_text = text[:last_nl + 1]
                 consumed_bytes = len(complete_text.encode('utf-8'))
-                # Log advanced this tick — reset the idle timer that gates
-                # the wall-clock expire below. Done outside the per-line
-                # loop so even ticks with only UnknownEvent / non-combat
-                # lines (chat, loot, cooldowns) still count as activity.
-                self._last_log_activity_wall = time.monotonic()
                 with _State.fights_lock:
                     # Re-check guards + detector existence — anything
                     # could have changed during the I/O window.
@@ -1743,28 +1887,18 @@ class _LiveFollower:
                     # (may be less than the chunk we read if the chunk
                     # ended mid-line).
                     _State.live_position = position + consumed_bytes
-        # Run wall-clock expire_stale ONLY when the log has been quiet
-        # for at least gap_seconds of REAL time. Original implementation
-        # ran every tick with `now=datetime.now()`, which phantom-expired
-        # active fights when EQ buffered the log behind the wall clock by
-        # >gap_seconds (Windows file flushing, EQ's own line buffer, etc.):
-        # the detector's last_ts is in LOG time, so a buffered-but-active
-        # combat looked identical to a genuine idle stretch. Gating on
-        # `_last_log_activity_wall` distinguishes the two — if the log
-        # is flushing bytes regularly, leave the in-progress fights alone
-        # and let the next damage event drive expiration if needed.
-        # The genuine-idle case (player out of combat / zone quiet) still
-        # works: the log goes silent, no new bytes arrive, the idle timer
-        # exceeds gap_seconds, and the fight closes so the overlay flips
-        # to recap. Static-walk path is unaffected — finalize_all() runs
-        # at end-of-walk regardless of this gate.
+        # Always run expire_stale at end-of-tick with WALL CLOCK as
+        # the anchor — NOT detector.last_event_ts. Without this, when
+        # the log goes idle (player out of combat / EQ paused / zone
+        # quiet), stale in-progress fights never close because the
+        # log-time anchor doesn't advance, and the overlay shows a
+        # phantom "active fight" indefinitely. The static-walk path
+        # is unaffected — finalize_all() handles end-of-walk separately.
         with _State.fights_lock:
             if (_State.logfile == self.logfile
                     and _State.live_follower is self
                     and _State.detector is not None):
-                idle = time.monotonic() - self._last_log_activity_wall
-                if idle >= _State.detector.gap_seconds:
-                    _State.detector.expire_stale(now=datetime.now())
+                _State.detector.expire_stale(now=datetime.now())
 
 
 def _start_live_follower_locked():
@@ -1867,6 +2001,11 @@ def _set_logfile(path: str):
         _State.parser_stats = None
         _State.detector = None
         _State.live_position = 0
+        # Reset the inter-fight grace timer so the previous log's
+        # in-flight encounter doesn't keep the new log's overlay in
+        # HUD mode after a swap.
+        _State.last_active_wall = 0.0
+        _State.snapshot_cache = None
         _State.sidecar = load_sidecar(abs_path)
         _clear_comparison_locked()
     _set_progress('idle')
@@ -1891,6 +2030,8 @@ def _invalidate_caches_locked(*, drop_combat: bool = False):
         # the invalidation.
         _State.detector = None
         _State.live_position = 0
+        _State.last_active_wall = 0.0
+        _State.snapshot_cache = None
         _stop_live_follower_locked()
         # The next consumer will trigger a fresh parse; reset progress so
         # the UI can show the new run from 0%.

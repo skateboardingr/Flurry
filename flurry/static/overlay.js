@@ -134,11 +134,16 @@ async function poll() {
 
 // When the user has pinned the overlay, drive the click-through bit
 // off the current view: HUD / counters during an active fight = pass
-// clicks through to EQ; recap = let the user click Copy buttons.
+// clicks through to EQ; recap (or grace-window frozen HUD) = let the
+// user interact. The `synthesized` flag distinguishes a real
+// in-progress active fight (server.py:_live_snapshot) from the
+// inter-fight grace-window frozen HUD — only the former wants
+// click-through ON; the synthesized one is post-combat data shown in
+// HUD layout, no reason to block clicks on it.
 // Skips when not pinned (server is in unpinned state, leave alone).
 function autoPin(d) {
   if (!d.overlay_pinned || _pinFlipInFlight) return;
-  const wantClickThrough = !!d.active_fight;
+  const wantClickThrough = !!d.active_fight && !d.active_fight.synthesized;
   if (wantClickThrough === d.overlay_click_through) return;
   _pinFlipInFlight = true;
   fetch('/api/overlay/pin', {
