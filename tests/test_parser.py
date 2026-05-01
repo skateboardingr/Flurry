@@ -412,6 +412,21 @@ def test_falling_damage_speculative_format():
     assert_eq(ev.damage_type, 'falling')
 
 
+def test_pain_and_suffering_unconscious_bleed():
+    """'Pain and suffering strikes you for N damage!' — bleed-out damage
+    when the player is at 0 HP / unconscious. Routed to attacker
+    '(unconscious)' so the damage shows up in damage-taken views without
+    faking a real mob attacker."""
+    line = '[Sat Apr 25 19:20:40 2026] Pain and suffering strikes you for 39155 damage!'
+    ev = parse_line(line)
+    assert isinstance(ev, SpellDamage), f'expected SpellDamage, got {type(ev).__name__}'
+    assert_eq(ev.attacker, '(unconscious)')
+    assert_eq(ev.target, 'You')
+    assert_eq(ev.damage, 39155)
+    assert_eq(ev.damage_type, 'unconscious')
+    assert_eq(ev.spell, 'Pain and suffering')
+
+
 def test_you_were_hit_by_non_melee():
     """'You were hit by non-melee for N damage.' — EQ doesn't name a
     source for these (literal 'non-melee' is the source descriptor).
@@ -527,6 +542,53 @@ def test_heal_passive_without_spell():
     assert ev.spell is None
 
 
+def test_heal_passive_no_healer_pet_self_heal():
+    """Pet self-heal proc — 'X`s pet has been healed for N hit points by SPELL.'
+    No `by HEALER` clause because the source is a proc on the pet itself.
+    Healer is set equal to target so it rolls up as a self-heal."""
+    line = "[Sat Apr 25 17:00:48 2026] Hacral`s pet has been healed for 45000 hit points by Enhanced Theft of Essence Effect XVI."
+    ev = parse_line(line)
+    assert isinstance(ev, HealEvent), f'expected HealEvent, got {type(ev).__name__}'
+    assert_eq(ev.healer, 'Hacral`s pet', 'self-heal: healer == target')
+    assert_eq(ev.target, 'Hacral`s pet')
+    assert_eq(ev.amount, 45000)
+    assert_eq(ev.spell, 'Enhanced Theft of Essence Effect XVI')
+
+
+def test_heal_passive_no_healer_with_overheal_parens():
+    """Same shape with the `(N)` gross-amount parenthetical — applied
+    amount can be 0 when target is already at full HP."""
+    line = "[Sat Apr 25 13:51:25 2026] Hacral`s pet has been healed for 0 (45000) hit points by Enhanced Theft of Essence Effect XVI."
+    ev = parse_line(line)
+    assert isinstance(ev, HealEvent)
+    assert_eq(ev.healer, 'Hacral`s pet')
+    assert_eq(ev.target, 'Hacral`s pet')
+    assert_eq(ev.amount, 0)
+    assert_eq(ev.spell, 'Enhanced Theft of Essence Effect XVI')
+
+
+def test_heal_passive_no_healer_named_pet():
+    """Mage pets with proper names (Onyx, Rover, Knothead, etc.) appear
+    without the backtick `'s pet` suffix because EQ uses their proper
+    name in this proc message. Still a self-heal."""
+    line = "[Sat Apr 25 17:36:15 2026] Onyx has been healed for 50000 hit points by Theft of Essence Effect XVII."
+    ev = parse_line(line)
+    assert isinstance(ev, HealEvent)
+    assert_eq(ev.healer, 'Onyx')
+    assert_eq(ev.target, 'Onyx')
+    assert_eq(ev.amount, 50000)
+
+
+def test_heal_passive_no_healer_does_not_steal_with_healer_form():
+    """The new no-healer pattern must not match lines that have a
+    `by HEALER` clause — those should still go through HEAL_PASSIVE_RE."""
+    line = '[Sat Apr 25 12:21:30 2026] Lunarya has been healed by Soloson for 86000 hit points by Healing Touch.'
+    ev = parse_line(line)
+    assert isinstance(ev, HealEvent)
+    assert_eq(ev.healer, 'Soloson', 'with-healer form should still win')
+    assert_eq(ev.target, 'Lunarya')
+
+
 # ----- Death events -----
 
 def test_was_slain_format():
@@ -554,6 +616,19 @@ def test_player_death():
     assert_eq(ev.victim, 'You')
     assert_eq(ev.killer, 'a deadly cloudwalker')
     assert ev.you_died is True
+
+
+def test_you_slew_format():
+    """When YOU deliver the killing blow, EQ writes 'You have slain X!'
+    instead of the third-person 'X was/has been slain by ...' form. Without
+    this pattern every solo kill silently expires via gap_seconds and gets
+    marked Incomplete in the UI."""
+    line = '[Sat Apr 25 12:32:47 2026] You have slain Pli Liako!'
+    ev = parse_line(line)
+    assert isinstance(ev, DeathMessage)
+    assert_eq(ev.victim, 'Pli Liako')
+    assert_eq(ev.killer, 'You')
+    assert ev.you_died is False
 
 
 # ----- Zone tracking -----

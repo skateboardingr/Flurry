@@ -1610,6 +1610,11 @@ class _LiveFollower:
         # Long-lived read handle; opened lazily on first tick, closed
         # when the thread exits or the orphan-guard fires.
         self._fh: Optional[BinaryIO] = None
+        # Wall-clock (monotonic) timestamp of the last tick that read new
+        # bytes from the log. Drives the gating on wall-clock expire_stale
+        # below — see _tick. Seeded at start so the first idle window
+        # is measured from when we began following, not from epoch.
+        self._last_log_activity_wall: float = time.monotonic()
 
     def start(self):
         if self._thread is not None and self._thread.is_alive():
@@ -1713,6 +1718,11 @@ class _LiveFollower:
             if last_nl >= 0:
                 complete_text = text[:last_nl + 1]
                 consumed_bytes = len(complete_text.encode('utf-8'))
+                # Log advanced this tick — reset the idle timer that gates
+                # the wall-clock expire below. Done outside the per-line
+                # loop so even ticks with only UnknownEvent / non-combat
+                # lines (chat, loot, cooldowns) still count as activity.
+                self._last_log_activity_wall = time.monotonic()
                 with _State.fights_lock:
                     # Re-check guards + detector existence — anything
                     # could have changed during the I/O window.
@@ -1733,18 +1743,28 @@ class _LiveFollower:
                     # (may be less than the chunk we read if the chunk
                     # ended mid-line).
                     _State.live_position = position + consumed_bytes
-        # Always run expire_stale at end-of-tick with WALL CLOCK as
-        # the anchor — NOT detector.last_event_ts. Without this, when
-        # the log goes idle (player out of combat / EQ paused / zone
-        # quiet), stale in-progress fights never close because the
-        # log-time anchor doesn't advance, and the overlay shows a
-        # phantom "active fight" indefinitely. The static-walk path
-        # is unaffected — finalize_all() handles end-of-walk separately.
+        # Run wall-clock expire_stale ONLY when the log has been quiet
+        # for at least gap_seconds of REAL time. Original implementation
+        # ran every tick with `now=datetime.now()`, which phantom-expired
+        # active fights when EQ buffered the log behind the wall clock by
+        # >gap_seconds (Windows file flushing, EQ's own line buffer, etc.):
+        # the detector's last_ts is in LOG time, so a buffered-but-active
+        # combat looked identical to a genuine idle stretch. Gating on
+        # `_last_log_activity_wall` distinguishes the two — if the log
+        # is flushing bytes regularly, leave the in-progress fights alone
+        # and let the next damage event drive expiration if needed.
+        # The genuine-idle case (player out of combat / zone quiet) still
+        # works: the log goes silent, no new bytes arrive, the idle timer
+        # exceeds gap_seconds, and the fight closes so the overlay flips
+        # to recap. Static-walk path is unaffected — finalize_all() runs
+        # at end-of-walk regardless of this gate.
         with _State.fights_lock:
             if (_State.logfile == self.logfile
                     and _State.live_follower is self
                     and _State.detector is not None):
-                _State.detector.expire_stale(now=datetime.now())
+                idle = time.monotonic() - self._last_log_activity_wall
+                if idle >= _State.detector.gap_seconds:
+                    _State.detector.expire_stale(now=datetime.now())
 
 
 def _start_live_follower_locked():

@@ -118,15 +118,23 @@ between the name and the `s`, not a curly quote, not an apostrophe.
 EQ has done this since launch. The `NAME` regex pattern in `parser.py`
 includes both `'` and `` ` `` in the allowed character set.
 
-### `was slain` vs `has been slain`
+### `was slain` vs `has been slain` vs `You have slain`
 
-Two death-message formats exist in the wild:
+Three death-message formats exist in the wild:
 
-- `X has been slain by Y!`   (common mobs, NPCs, most kills)
+- `X has been slain by Y!`   (common mobs, NPCs, most kills by others)
 - `X was slain by Y!`        (raid bosses often use this form)
+- `You have slain X!`        (FIRST-PERSON KILLER — when YOU deliver
+                              the killing blow, EQ flips to the active
+                              voice instead of writing `X has been
+                              slain by You!`)
 
-We match both. Originally we only matched the first, and missed every
-raid kill — including the Shei Vinitras kill that started this project.
+We match all three. The first-person form was missed for a long time
+because the raid fixtures we tested against had multiple players and
+the killing blows usually went to someone else. Without it, every solo
+kill silently expires via `gap_seconds` and the fight gets marked
+`fight_complete=False` ("Incomplete" in the UI). Symptom: a session
+where you soloed trash and every row in the session table is yellow.
 
 ### `You hit X for N points of damage` (no spell name) is melee
 
@@ -241,6 +249,31 @@ loose for legitimate uses but eliminates the passive-collision path.
 patterns now do too. If you add a new damage/heal pattern, follow this
 shape — don't combine `(?:verb|verbs)` with NAME unless you're certain
 no passive form exists.
+
+### Passive heal without a `by HEALER` clause is a self-heal proc
+
+EQ writes weapon-proc and pet self-heal procs in a stripped passive form
+that omits the healer:
+
+  `Hacral\`s pet has been healed for 45000 hit points by Enhanced Theft of Essence Effect XVI.`
+  `Onyx has been healed for 50000 hit points by Theft of Essence Effect XVII.`
+
+Note the missing `by HEALER` — the source is the proc on the target's
+own gear, not a caster. We treat these as **self-heals** (`healer ==
+target`) so they sum into the target's healing-received column without
+fragmenting the per-healer rollup with a "(proc)" or "(unattributed)"
+fake row. `HEAL_PASSIVE_NO_HEALER_RE` runs after `HEAL_PASSIVE_RE` (the
+with-healer form is more specific) and after `HEAL_RE`. EQ uses pet
+proper names without `'s pet` here when the pet has one (Onyx, Rover,
+Knothead, etc.) — they're still mage pets, just named.
+
+### Pain and suffering = unconscious bleed-out
+
+`Pain and suffering strikes you for 39155 damage!` fires when you're at
+0 HP / downed and bleeding out. Always targets `You` (EQ logs your own
+perspective). Attacker tagged `(unconscious)` — its own sentinel,
+distinct from `(unattributed)` and `(falling)` — so it reads as a
+self-inflicted death-state effect rather than faking a mob attacker.
 
 ### Generic non-melee lines have no source — attributed to "(unattributed)"
 
@@ -711,6 +744,93 @@ pattern, think about ordering.
       elsewhere still replace primary), and N>2 logs (the parallel-
       state approach caps at exactly two loaded logs by design).
 
+### Live tail mode + player overlay (v0.6.x)
+- [x] `_CombatDetector` (analyzer.py) is a long-lived class that owns
+      the fight-detection state machine. `feed_event(ev)` consumes
+      events one at a time; `expire_stale(now)` closes in-progress
+      fights whose `last_ts` is older than `gap_seconds` relative to
+      `now` (wall-clock anchor in live mode, log-clock in static).
+      `walk_into_detector` replaces the inline event loop in
+      `detect_combat` so the static and live paths share one
+      accumulator. `snapshot()` returns a filtered list of completed
+      fights + heals.
+- [x] `_LiveFollower` (server.py) — background thread that tails the
+      active log every 250ms. Holds the file open with a **persistent
+      handle** and `seek/read`s on each tick — re-opening every tick
+      was hitting a Windows directory-cache lag that delayed updates
+      by 5–7s. The handle survives across ticks; closes on follower
+      stop / orphan-guard / thread exit. Lock-coordinated via
+      `_State.fights_lock`; orphan ticks (different log loaded, or
+      follower replaced) bail without touching state.
+- [x] `/api/live/snapshot` exposes the in-progress active fight, the
+      most-recent completed encounter, and overlay pin state. Active-
+      fight target is picked by **highest cumulative damage** among
+      `received > dealt + healed` enemies — same classifier the
+      encounter detail uses, so friendly PCs (who get fights opened
+      against them as the defender) drop out of the candidate set
+      and the displayed target sticks on the boss.
+- [x] **Late death message handling.** With tight `gap_seconds`
+      (e.g. 2s), the gap can expire BEFORE the death message arrives
+      in the log (DoT kills, log buffering). `feed_event` walks back
+      through `completed` (within `gap_seconds + 10s`) and flips the
+      matching slice's `fight_complete` to True. Bounded walk so
+      ancient deaths don't scan the whole list.
+- [x] **Live-mode session catch-up.** `_State.fights/heals` are a
+      frozen snapshot from the initial parse, so `/api/session`
+      stayed stale as the live follower added to `detector.completed`.
+      `_get_encounters_locked` re-snapshots when the detector's
+      completed count exceeds `_State.fights_count_at_snapshot`,
+      and invalidates the encounter cache.
+- [x] Wall-clock `expire_stale` in the live follower so phantom in-
+      progress fights close after `gap_seconds` of REAL idle even
+      when the log clock doesn't advance.
+- [x] Player overlay: separate `/overlay` page (`overlay.html` +
+      `overlay.{css,js}`) polls `/api/live/snapshot` at 250ms.
+      Three views: empty (load a log), active fight (4 counters
+      damage out/in + heal out/in + HP-Δ bar + target name + dur),
+      recap (last encounter top-10 damage rows + Copy buttons).
+      Recap is keyed by encounter `start+end` and only re-renders
+      on key change — every-tick `innerHTML` rebuild was destroying
+      the Copy buttons mid-click and eating clicks where mousedown
+      and mouseup straddled a poll. Active view rebuilds every
+      tick (counters change, no interactive elements to lose).
+      Default window size 320×400.
+- [x] Pin overlay: server-side Win32 ctypes flips `WS_EX_TOPMOST +
+      WS_EX_LAYERED + (?WS_EX_TRANSPARENT)` on the browser window
+      via `SetWindowLongPtrW`. The click-through bit **auto-toggles**
+      based on the overlay's view: HUD mode (active fight) keeps it
+      on, recap drops it so Copy buttons are clickable. State split:
+      `_State.overlay_pinned` is the user's intent (Pin/Unpin from
+      main UI); `_State.overlay_click_through` tracks the currently-
+      applied bit. Overlay POSTs a flip on view transitions.
+- [x] Clipboard parses (overlay recap): **Copy parse** (single-line
+      `name dmg %% dps` separated by ` | `, all 10 rows) and **Copy
+      short** (top-5 names + damage + dps). EQ chat collapses
+      multi-line so single-line is the only readable format
+      in-game. **Combine pets** toggle (default on) rolls the
+      player's pets into the player row before formatting. Channel
+      selector persists in localStorage; defaults to `/gsay`.
+- [x] **Mage / charmed pet rollup.** `apply_pet_owners` rewrites
+      pet names that EQ doesn't already attribute. Pet-owner editor
+      on encounter detail populates the sidecar; live snapshot
+      applies the mapping every tick so the overlay's "you + your
+      pets" counters include mage pets without per-edit cache busts.
+- [x] Native file picker: server-side `tkinter.filedialog.
+      askopenfilename` opens the OS file dialog so users can pick a
+      log via the standard Windows Browse… AND get live tracking on
+      the original file. Drag-drop path (copies to `%TEMP%/flurry-
+      uploads/`, follows the static copy) still exists.
+- [x] **Session view auto-refresh between fights.** When a new
+      encounter forms, the session table re-renders within ~1s.
+      Trigger is `last_encounter.encounter_id` change combined with
+      `!active_fight` — re-rendering during active combat would
+      flicker the table on every fight close with tight params.
+      Encounters that completed mid-combat batch up and appear at
+      the next quiet moment.
+- [x] `tests/sim_live_log.py` — appends fake combat lines at a
+      configurable rate so live-tail behavior can be validated
+      without an actual EQ session.
+
 ### Sidecar / user overrides (`flurry/sidecar.py`)
 - [x] `<logfile>.flurry.json` next to each log holds two kinds of edits:
       pet-owner assignments (`{actor: owner}`) and manual encounter
@@ -916,6 +1036,89 @@ Flurry ships as a **standalone app**, not as a CLI installer. The shape:
   script invokes PyInstaller with the canonical flags. Storing the
   recipe in source means future rebuilds match.
 
+## Live tail / overlay — design decisions
+
+`_CombatDetector` + `_LiveFollower` shape the live path. The
+non-obvious choices:
+
+- **Detector class, not in-line state.** The static parse used to
+  build an ad-hoc state dict inside `detect_combat`'s loop. Lifting
+  it into `_CombatDetector` lets the live follower feed events one
+  at a time into the SAME accumulator the static parse populates.
+  No code duplication; static and live differ only in WHO calls
+  `feed_event` and how often.
+
+- **Persistent file handle in the follower.** Re-opening the log
+  every 250ms tick had a Windows-specific 5–7s lag — directory-
+  cache metadata lagged actual file growth while EQ was streaming.
+  A long-lived `seek/read` on the same handle reads bytes the
+  moment they land. Closes on stop / orphan-guard / thread exit.
+
+- **Wall-clock anchor for `expire_stale` in live mode, gated on
+  log idle.** Static parses use the log's last-event timestamp as
+  the gap anchor — fine because the walk ends at `finalize_all`.
+  Live mode needs phantom in-progress fights to close after
+  `gap_seconds` of REAL-WORLD idle (player walked away, log went
+  quiet) so the overlay flips to recap. `_LiveFollower._tick`
+  tracks `_last_log_activity_wall` (monotonic clock, updated
+  whenever the tick reads new bytes) and only calls
+  `expire_stale(wall_now)` when `monotonic() -
+  _last_log_activity_wall >= gap_seconds`. The earlier version ran
+  every tick unconditionally, which phantom-expired active fights
+  when EQ buffered the log behind the wall clock by >`gap_seconds`
+  (Windows flushing, EQ's own line buffer): the detector's
+  `last_ts` is in LOG time, so buffered-but-active combat looked
+  identical to genuine idle. Gating on log activity distinguishes
+  the two — if the log is flushing bytes, leave in-progress
+  fights alone and let the next damage event drive expiration.
+
+- **Late death lookup.** With tight `gap_seconds` (e.g. 2s), the
+  gap can fire BEFORE the death message arrives (DoT kills, log
+  buffering). When a death event comes for a target NOT in
+  `in_progress`, the detector walks back through `completed`
+  (within `gap_seconds + 10s`) and flips the matching slice's
+  `fight_complete`. Bounded walk so ancient deaths don't scan the
+  whole list.
+
+- **Active-fight target via received > dealt + healed.** The
+  detector creates a fight-per-defender; friendly PCs taking hits
+  from mobs have defender-fights too, so a naive "most recent fight
+  with non-pet non-you target" picks them as the active fight and
+  the overlay's title flickers between friendlies and enemies.
+  Same classifier the encounter detail uses — keeps friendlies
+  out of the candidate set. Highest cumulative damage among the
+  survivors picks the boss reliably.
+
+- **Overlay re-render only on identity change.** The overlay polls
+  every 250ms; full `innerHTML` rebuild every tick was destroying
+  the recap's Copy buttons mid-click. Keyed re-render on encounter
+  `start+end` so buttons stay stable. Active view IS rebuilt every
+  tick (counters change, no interactive elements to lose).
+
+- **Auto-toggle click-through on the pin.** `WS_EX_TRANSPARENT` is
+  window-wide — can't make individual buttons clickable while the
+  rest is click-through. Solution: when the overlay shows recap
+  (Copy buttons visible), drop `WS_EX_TRANSPARENT` but keep
+  `WS_EX_TOPMOST`; on active fight (HUD), restore both. Driven
+  from the overlay client (knows what it's rendering) via
+  `POST /api/overlay/pin` with `click_through=` true/false.
+
+- **Session view auto-refresh — encounter id, not end timestamp.**
+  Watching `last_encounter.end` triggered re-render every time a
+  new fight joined the latest encounter (every poll under tight
+  params). Watching `last_encounter.encounter_id` only fires when
+  a brand-new encounter forms. Combined with `!active_fight` so
+  the table doesn't flicker during combat — encounters that
+  completed mid-combat batch up and appear at the next quiet
+  moment. We deliberately don't auto-refresh contents of an
+  EXISTING encounter row (DUR/DAMAGE growth as fights extend it);
+  the user can hit Refresh for that.
+
+- **Pin/Unpin live in the main UI, not the overlay.** Once
+  click-through is on, the overlay can't be clicked to unpin
+  itself — so the unpin control has to be reachable from
+  somewhere always-clickable.
+
 ## Known issues / debt
 
 - **Test fixture path is hardcoded** to `/mnt/user-data/uploads/...` in
@@ -946,46 +1149,31 @@ Flurry ships as a **standalone app**, not as a CLI installer. The shape:
 
 These are documented in README.md too; this is the working list.
 
-1. **Healing and tanking views** — same per-attacker model but for
-   HPS (heals received per target) and damage mitigated/taken. Touches
-   parser (new event types), analyzer (new accumulators), and reports.
+1. **JSON export** — `flurry-dps --json`, `flurry-timeline --json`,
+   and `flurry-session --json` for piping to other tools. The UI
+   already has its own JSON via `/api/*`; the CLI flags would just
+   shell out.
 
-2. **Log diffing** — compare same-boss fights before and after a gear
-   change. "What did this new weapon actually do?"
+2. **Configurable overlay layout** — counter sizes and panel
+   arrangement are hardcoded today; let users customize them.
 
-3. **JSON export** — `flurry-dps --json`, `flurry-timeline --json`, and
-   `flurry-session --json` for piping to other tools. The UI has its
-   own JSON via `/api/*` already; the CLI flags would just shell out.
+3. **HP-Δ history chart in the overlay** — only the current rate
+   is shown today, not a trace over the last few seconds. A small
+   sparkline under the HP-Δ bar would catch incoming spike damage
+   before it lands.
 
-4. **Live tail mode** — `tail.py` already supports follow-mode; the
-   analyzer and server don't. Would let you watch DPS in real time
-   during a fight, and push UI updates via SSE or polling.
+4. **Multi-character overlay** — the overlay follows whichever log
+   the main UI has loaded. One window per follower would let
+   multi-boxers watch alts at once. Cleanly factor a per-character
+   detector + snapshot pipeline so the live state isn't `_State`-
+   global.
 
-   - **Player overlay (sub-feature of live tail).** A compact,
-     always-on-top window for the active character with four live
-     counters: damage out, damage in, healing out, healing in. The
-     idea is to glance at your own performance mid-fight without
-     alt-tabbing to the full UI. Open questions: which char is "you"
-     (read from the log filename `eqlog_<char>_<server>.txt`, or let
-     the user pick from a roster?), how to render an always-on-top
-     window stdlib-only (probably can't — likely needs a small Tk or
-     wx layer, or a borderless browser pop-out from the existing
-     server), and whether the counters reset per-fight or per-encounter
-     or run as rolling N-second windows. Worth deciding all three
-     before building.
-
-   - **HP delta indicator (sub-feature of live tail).** A live readout
-     of net HP change over the last second — green when net positive
-     (heal > damage taken), red when net negative — so you can spot
-     trouble before the health bar gets to it. Derived from log events
-     (damage-taken + heals-received summed over a rolling window),
-     since EQ doesn't continuously emit absolute HP. Open questions:
-     rolling-1s vs fixed-bucket aggregation, a "no change" threshold so
-     small ticks don't flicker the color, and whether this lives inside
-     the player overlay or as a separate always-on-top widget. Probably
-     same window as the overlay above, but cleanly factor the delta
-     calculation so a future "raid HP deltas for the whole group"
-     feature can reuse it.
+Things that used to be on this list and have shipped — encounter
+grouping, pet ownership, session-summary rollups, healing tab,
+tanking tab with avoidance breakdown, life-delta toggle, in-log
+encounter diff, cross-log encounter diff, live tail mode, player
+overlay with HP-Δ indicator. See `RELEASES.md` for the running
+history.
 
 ---
 

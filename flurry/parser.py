@@ -131,6 +131,17 @@ FALLING_DAMAGE_RE = re.compile(
     r'^You take (?P<dmg>\d+) points? of falling damage\.(?P<rest>.*)$'
 )
 
+# --- Unconscious bleed-out: 'Pain and suffering strikes you for N damage!' ---
+# EQ writes this when you're at 0 HP (downed/unconscious) and bleeding out.
+# No external source — the damage comes from your own dying state — so we
+# attribute to '(unconscious)' (separate sentinel from '(unattributed)' /
+# '(falling)') to keep these visible in damage-taken views without faking
+# a mob attacker. Always targets 'You' because EQ filters the log to your
+# own perspective; you never see other players bleed out.
+PAIN_AND_SUFFERING_RE = re.compile(
+    r'^Pain and suffering strikes you for (?P<dmg>\d+) damage!$'
+)
+
 # --- DoT damage: 'X has/have taken N damage from SPELL by Y.' ---
 # Modern EQ writes DoT ticks in this passive form with the source named
 # *after* `by`. Matches:
@@ -222,6 +233,20 @@ HEAL_PASSIVE_RE = re.compile(
     rf'(?: by (?P<spell>[^.]+?))?\.(?P<rest>.*)$'
 )
 
+# --- Self-heal proc: 'X has been healed for N hit points by SPELL.' ---
+# Same passive shape as HEAL_PASSIVE_RE but with NO `by HEALER` clause.
+# EQ writes weapon-proc and pet self-heal procs (Theft of Essence, etc.)
+# without naming a healer because the source is the proc, not a caster.
+# Per EQ knowledge: these are self-heals — the target heals themselves —
+# so the builder uses `healer = target`. Must run AFTER HEAL_PASSIVE_RE
+# (the with-healer form is more specific) and AFTER HEAL_RE (so 'X healed
+# Y...' active form gets first crack).
+HEAL_PASSIVE_NO_HEALER_RE = re.compile(
+    rf'^(?P<target>You|{BODY_NAME}) (?:has been|have been) healed '
+    rf'(?:over time )?for (?P<amt>\d+)(?:\s+\(\d+\))? hit points? '
+    rf'by (?P<spell>[^.]+?)\.(?P<rest>.*)$'
+)
+
 
 # --- Heal: 'X healed Y for N hit points by SPELL.' ---
 # The auxiliary 'has'/'have' shows up in some EQ versions ('You have healed
@@ -241,6 +266,12 @@ SLAIN_RE = re.compile(r'^(?P<victim>.+?) (?:has been slain|was slain) by (?P<kil
 
 # --- Death: 'You have been slain by Y!' ---
 YOU_SLAIN_RE = re.compile(r'^You have been slain by (?P<killer>.+?)!$')
+
+# --- Death: 'You have slain X!' (first-person killer; EQ swaps the
+# active form when YOU deliver the killing blow, instead of writing
+# 'X has been slain by You!'). Without this, every solo kill expires
+# via gap_seconds and gets marked Incomplete.
+YOU_SLEW_RE = re.compile(r'^You have slain (?P<victim>.+?)!$')
 
 # --- Zone: 'You have entered ZONE.' ---
 # Negative lookahead for 'an area' to skip sub-zone messages like
@@ -343,6 +374,19 @@ def _build_falling_damage(ts, raw, m):
                        modifiers=modifiers)
 
 
+def _build_pain_and_suffering(ts, raw, m):
+    # See PAIN_AND_SUFFERING_RE — unconscious bleed-out damage. Attacker
+    # tagged '(unconscious)' (its own sentinel) so it reads as a
+    # self-inflicted death-state effect rather than faking a real attacker.
+    return SpellDamage(timestamp=ts, raw=raw,
+                       attacker='(unconscious)',
+                       target='You',
+                       damage=int(m.group('dmg')),
+                       damage_type='unconscious',
+                       spell='Pain and suffering',
+                       modifiers=[])
+
+
 def _build_melee_hit(ts, raw, m):
     """Builder for both first- and third-person melee hits.
     Both regex variants name the same groups (attacker, verb, target, dmg, rest)
@@ -409,6 +453,13 @@ def _build_slain(ts, raw, m):
                         you_died=False)
 
 
+def _build_you_slew(ts, raw, m):
+    return DeathMessage(timestamp=ts, raw=raw,
+                        victim=m.group('victim'),
+                        killer='You',
+                        you_died=False)
+
+
 def _build_zone_entered(ts, raw, m):
     return ZoneEntered(timestamp=ts, raw=raw, zone=m.group('zone'))
 
@@ -446,6 +497,21 @@ def _build_heal_passive(ts, raw, m):
                      modifiers=modifiers)
 
 
+def _build_heal_passive_no_healer(ts, raw, m):
+    """Builder for the unattributed passive-heal form ('X has been healed
+    for N hit points by SPELL.') — weapon-proc / pet self-heal procs.
+    Healer is set equal to target because per EQ semantics these are
+    self-heals (the target heals themselves via the proc)."""
+    _, modifiers = _strip_modifiers(m.group('rest'))
+    target = m.group('target')
+    return HealEvent(timestamp=ts, raw=raw,
+                     healer=target,
+                     target=target,
+                     amount=int(m.group('amt')),
+                     spell=m.group('spell'),
+                     modifiers=modifiers)
+
+
 # Order: most-specific first. SPELL_DAMAGE has 'by SPELL' which is more
 # specific than the bare melee patterns; we put it before MELEE_HIT.
 PATTERNS: List[Tuple[re.Pattern, Callable]] = [
@@ -455,6 +521,7 @@ PATTERNS: List[Tuple[re.Pattern, Callable]] = [
     (NONMELEE_DAMAGE_RE, _build_nonmelee_damage),
     (YOU_NONMELEE_RE,    _build_you_nonmelee),
     (FALLING_DAMAGE_RE,  _build_falling_damage),
+    (PAIN_AND_SUFFERING_RE, _build_pain_and_suffering),
     (MELEE_HIT_1ST_RE,   _build_melee_hit),
     (MELEE_HIT_3RD_RE,   _build_melee_hit),
     (MELEE_MISS_1ST_RE,  _build_melee_miss),
@@ -462,7 +529,9 @@ PATTERNS: List[Tuple[re.Pattern, Callable]] = [
     (SPELL_RESIST_RE,    _build_spell_resist),
     (HEAL_PASSIVE_RE,    _build_heal_passive),
     (HEAL_RE,            _build_heal),
+    (HEAL_PASSIVE_NO_HEALER_RE, _build_heal_passive_no_healer),
     (YOU_SLAIN_RE,       _build_you_slain),
+    (YOU_SLEW_RE,        _build_you_slew),
     (SLAIN_RE,           _build_slain),
     (ZONE_ENTERED_RE,    _build_zone_entered),
 ]
